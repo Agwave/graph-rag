@@ -1,0 +1,16 @@
+[project]
+name = "graph-rag"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "langchain>=0.3.25",
+    "networkx>=3.5",
+    "pillow>=11.2.1",
+    "pyarrow>=20.0.0",
+    "pymupdf>=1.26.0",
+    "sentence-transformers>=4.1.0",
+    "torch>=2.7.0",
+    "transformers>=4.52.4",
+]
