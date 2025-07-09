@@ -10,19 +10,20 @@ from PIL import Image
 
 
 def run():
-    dir_ = ("/home/chenyinbo/.cache/huggingface/hub/datasets--google--spiqa/snapshots/"
-            "1774b71511f029b82089a069d75328f25fbf0705/SPIQA_train_val_test-A_extracted_paragraphs")
+    texts_dir = "datasets/spiqa/SPIQA_train_val_test-A_extracted_paragraphs"
+    images_dir = "datasets/spiqa/train_val/SPIQA_train_val_Images"
+    model_name = "models/clip-vit-base-patch32"
 
-    model_name = "openai/clip-vit-base-patch32"
     model, processor = _init_model_and_processor(model_name)
+    curr = 0
+
     search_text = None
     search_embeddings = None
     search_index = None
     id_to_text = dict()
-    curr = 0
     index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-    for file_name in os.listdir(dir_)[:10]:
-        text = _read_text_file(os.path.join(dir_, file_name))
+    for file_name in os.listdir(texts_dir)[:10]:
+        text = _read_text_file(os.path.join(texts_dir, file_name))
         texts = _trunk_by_paragraph(text)
         logger.info(f"before trunk: {text[:100]}")
         logger.info(f"after trunk (first text): {texts[0]}")
@@ -41,19 +42,53 @@ def run():
 
         curr += len(texts)
 
-    file_name = "my_rag_index.faiss"
-    faiss.write_index(index, file_name)
-    logger.info(f"written index to {file_name}")
-
-    loaded_index = faiss.read_index("my_rag_index.faiss")
-    logger.info(f"loaded index from {file_name}")
-
-    distances, find_indices = loaded_index.search(search_embeddings, 1)
+    distances, find_indices = index.search(search_embeddings, 1)
     logger.info(f"search | index {search_index} | text {search_text[:200]}")
     index_id = find_indices[0][0]
     distance = distances[0][0]
     find_text = id_to_text[index_id]
     logger.info(f"find | index {index_id} | text {find_text} | distance {distance}")
+
+    search_path = None
+    search_embeddings = None
+    search_index = None
+    id_to_image_path = dict()
+    for image_dir in os.listdir(images_dir)[:10]:
+        images = []
+        paths = []
+        for file_name in os.listdir(os.path.join(images_dir, image_dir))[:10]:
+            img = Image.open(os.path.join(images_dir, image_dir, file_name)).convert("RGB")
+            images.append(img)
+            paths.append(os.path.join(image_dir, file_name))
+        logger.info(f"images count: {len(images)}")
+
+        image_embeddings = _embedding_image(model, processor, images).cpu().numpy()
+        indices = []
+        for i, path in enumerate(paths):
+            idx = i + curr
+            indices.append(idx)
+            id_to_image_path[idx] = path
+        index.add_with_ids(image_embeddings, np.array(indices))
+
+        search_embeddings = image_embeddings[0:1, :]
+        search_path = paths[0]
+        search_index = curr
+
+        curr += len(paths)
+
+    distances, find_indices = index.search(search_embeddings, 1)
+    logger.info(f"search | index {search_index} | image {search_path}")
+    index_id = find_indices[0][0]
+    distance = distances[0][0]
+    find_image_path = id_to_image_path[index_id]
+    logger.info(f"find | index {index_id} | image {find_image_path} | distance {distance}")
+
+    file_name = "my_rag_index.faiss"
+    faiss.write_index(index, file_name)
+    logger.info(f"written index to {file_name}")
+
+    faiss.read_index("my_rag_index.faiss")
+    logger.info(f"loaded index from {file_name}")
 
 
 def _init_model_and_processor(model_name: str) -> (CLIPModel, CLIPProcessor):
@@ -72,8 +107,8 @@ def _embedding_texts(model: CLIPModel, processor: CLIPProcessor, texts: list[str
     return text_embeddings
 
 
-def _embedding_image(model: CLIPModel, processor: CLIPProcessor, image: Image.Image) -> torch.Tensor:
-    inputs = processor(images=[image], return_tensors="pt")
+def _embedding_image(model: CLIPModel, processor: CLIPProcessor, images: list[Image.Image]) -> torch.Tensor:
+    inputs = processor(images=images, return_tensors="pt")
     device = model.device
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
