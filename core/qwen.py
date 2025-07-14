@@ -6,9 +6,9 @@ from openai import Client
 from pydantic import BaseModel, Field
 
 
-PROMPT = "You are given a question, paragraphs from a scientific paper, a few input images, and a caption corresponding to each input image. \
+PROMPT = """You are given a question, paragraphs from a scientific paper, a few input images, and a caption corresponding to each input image. \
 Please answer the question based on the paper, input images and corresponding captions. \
-Question: <question>. Output in the following format: {'Answer': 'Direct Answer to the Question'}. \n"
+Question: <question>. Output in the following json format: {"Answer": "Direct Answer to the Question"}. \n"""
 
 
 class ImageInfo(BaseModel):
@@ -54,6 +54,6 @@ def _extract_answer(text: str) -> str:
     json_end = text.rfind("```")
     if json_start == -1 or json_end == -1:
         logger.warning(f"_extract_json failed: {text}")
-        return text
+        return json.loads(text.strip())["Answer"]
     answer = json.loads(text[json_start+7:json_end].strip())["Answer"]
     return answer

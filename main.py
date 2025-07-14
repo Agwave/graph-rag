@@ -1,5 +1,6 @@
 import json
 import os
+from datetime import datetime
 
 import faiss
 import numpy as np
@@ -29,7 +30,19 @@ def run():
     if not os.path.exists(WRITE_DIR):
         os.makedirs(WRITE_DIR)
 
-    pred_answers, gt_answers = [], []
+    now = datetime.now()
+    curr_time = now.strftime("%Y%m%d%H%M")
+    logger.info(f"current tag {curr_time}")
+
+    skip_qa_count = 0
+    skip_qa_filename = os.path.join(WRITE_DIR, f"skip_qa_{curr_time}.txt")
+    if os.path.exists(skip_qa_filename):
+        with open(skip_qa_filename, "r", encoding="utf-8") as f:
+            skip_qa_count = int(f.read())
+
+    gen_qa_filename = os.path.join(WRITE_DIR, f"gen_qa_{curr_time}.jsonl")
+
+    curr_qa_count = 0
     for paper_id, paper in test_a_data.items():
 
         images = []
@@ -40,10 +53,23 @@ def run():
                 caption=image_detail["caption"],
             ))
 
-        data = []
         paragraphs = _read_text_file(os.path.join(paragraphs_dir, f"{paper_id}.txt"))
         for i, qa in enumerate(paper["qa"]):
-            answer = qwen_run(client, qa["question"], paragraphs, images)
+            curr_qa_count += 1
+            if skip_qa_count > 0:
+                skip_qa_count -= 1
+                logger.info(f"skip qa {curr_qa_count}")
+                continue
+
+            logger.info(f"compute current qa {curr_qa_count} ...")
+
+            try:
+                answer = qwen_run(client, qa["question"], paragraphs, images)
+            except Exception as e:
+                logger.warning(f"qwen_run failed: {e}")
+                with open(skip_qa_filename, "w", encoding="utf-8") as f:
+                    f.write(str(curr_qa_count))
+                continue
 
             logger.info(f"paragraphs len: {len(paragraphs)}")
             logger.info(f"images {images}")
@@ -57,18 +83,29 @@ def run():
                 "pred_answer": answer,
                 "gt_answer": qa["answer"],
             }
-            data.append(d)
 
-        for d in data:
-            pred_answers.append(d["pred_answer"])
-            gt_answers.append(d["gt_answer"])
+            with open(gen_qa_filename, "a", encoding="utf-8") as f:
+                f.write(json.dumps(d, ensure_ascii=False) + "\n")
 
-        break # TODO DELETE
+            with open(skip_qa_filename, "w", encoding="utf-8") as f:
+                f.write(str(curr_qa_count))
 
-    pred_path = os.path.join(WRITE_DIR, "pred.json")
-    gt_path = os.path.join(WRITE_DIR, "gt.json")
+
+    pred_answers, gt_answers = [], []
+    with open(gen_qa_filename, "r", encoding="utf-8") as f:
+        for line in f:
+            data = json.loads(line.strip())
+            pred_answers.append(data["pred_answer"])
+            gt_answers.append(data["gt_answer"])
+
+    pred_path = os.path.join(WRITE_DIR, f"pred_{curr_time}.json")
+    gt_path = os.path.join(WRITE_DIR, f"gt_{curr_time}.json")
     create_coco_eval_file(pred_path, gt_path, pred_answers, gt_answers)
-    score_compute(pred_path, gt_path, metrics=["Bleu_4", "METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
+    score = score_compute(pred_path, gt_path, metrics=["Bleu_4", "METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
+
+    metric_path = os.path.join(WRITE_DIR, f"metric_{curr_time}.json")
+    with open(metric_path, "w", encoding="utf-8") as f:
+        json.dump(score, f, ensure_ascii=False)
 
 
 def _run_embedding_texts_images():
