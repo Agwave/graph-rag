@@ -1,15 +1,61 @@
+import json
 import os
 
 import faiss
 import numpy as np
+import pandas as pd
+import pyarrow.parquet as pq
 import torch
-
 from loguru import logger
-from transformers import CLIPProcessor, CLIPModel
+from openai import OpenAI
 from PIL import Image
+from transformers import CLIPProcessor, CLIPModel
+
+from core.conf import show_env, SPIQA_DIR, WRITE_DIR
+from core.qwen import run as qwen_run, ImageInfo
 
 
 def run():
+    show_env()
+    client = OpenAI(api_key="sk-c450e178a972467d93b282e218c1dfba",
+                    base_url="https://dashscope.aliyuncs.com/compatible-mode/v1")
+    test_data_path = os.path.join(SPIQA_DIR, "test-A/SPIQA_testA.json")
+    paragraphs_dir = os.path.join(SPIQA_DIR, "SPIQA_train_val_test-A_extracted_paragraphs")
+    images_dir = os.path.join(SPIQA_DIR, "test-A/SPIQA_testA_Images_224px")
+
+    with open(test_data_path, "r", encoding="utf-8") as f:
+        test_a_data = json.load(f)
+    if not os.path.exists(WRITE_DIR):
+        os.makedirs(WRITE_DIR)
+
+    for paper_id, paper in test_a_data.items():
+
+        images = []
+        for image_name, image_detail in paper["all_figures"].items():
+            images.append(ImageInfo(
+                type="image/png",
+                path=os.path.join(images_dir, paper_id, image_name),
+                caption=image_detail["caption"],
+            ))
+
+        data = []
+        paragraphs = _read_text_file(os.path.join(paragraphs_dir, f"{paper_id}.txt"))
+        for i, qa in enumerate(paper["qa"]):
+            answer = qwen_run(client, qa["question"], paragraphs, images)
+            d = {
+                "id": f"{paper_id}_{i}",
+                "question": qa["question"],
+                "predict_answer": answer,
+                "label_answer": qa["answer"],
+            }
+            data.append(d)
+
+        with open(os.path.join(WRITE_DIR, "result.jsonl"), "a", encoding="utf-8") as f:
+            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+        break
+
+
+def _run_embedding_texts_images():
     texts_dir = "datasets/spiqa/SPIQA_train_val_test-A_extracted_paragraphs"
     images_dir = "datasets/spiqa/train_val/SPIQA_train_val_Images"
     model_name = "models/clip-vit-base-patch32"
@@ -131,6 +177,14 @@ def _id_to_text(texts: list[str], curr: int) -> dict[int, str]:
     for i, text in enumerate(texts):
         res[i + curr] = text
     return res
+
+
+def _read_parquet(path: str, n_rows: int) -> pd.DataFrame:
+    pf = pq.ParquetFile(path)
+    first_iter_batch = pf.iter_batches(batch_size=n_rows)
+    first_batch = next(first_iter_batch)
+    df_head = first_batch.to_pandas()
+    return df_head.head(n_rows)
 
 
 if __name__ == '__main__':
