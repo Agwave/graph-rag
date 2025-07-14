@@ -12,6 +12,7 @@ from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
 from core.conf import show_env, SPIQA_DIR, WRITE_DIR
+from core.metric import create_coco_eval_file, score_compute
 from core.qwen import run as qwen_run, ImageInfo
 
 
@@ -28,6 +29,7 @@ def run():
     if not os.path.exists(WRITE_DIR):
         os.makedirs(WRITE_DIR)
 
+    pred_answers, gt_answers = [], []
     for paper_id, paper in test_a_data.items():
 
         images = []
@@ -42,17 +44,31 @@ def run():
         paragraphs = _read_text_file(os.path.join(paragraphs_dir, f"{paper_id}.txt"))
         for i, qa in enumerate(paper["qa"]):
             answer = qwen_run(client, qa["question"], paragraphs, images)
+
+            logger.info(f"paragraphs len: {len(paragraphs)}")
+            logger.info(f"images {images}")
+            logger.info(f"question: {qa['question']}")
+            logger.info(f"gt_answer: {qa['answer']}")
+            logger.info(f"pred_answer: {answer}")
+
             d = {
                 "id": f"{paper_id}_{i}",
                 "question": qa["question"],
-                "predict_answer": answer,
-                "label_answer": qa["answer"],
+                "pred_answer": answer,
+                "gt_answer": qa["answer"],
             }
             data.append(d)
 
-        with open(os.path.join(WRITE_DIR, "result.jsonl"), "a", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
-        break
+        for d in data:
+            pred_answers.append(d["pred_answer"])
+            gt_answers.append(d["gt_answer"])
+
+        break # TODO DELETE
+
+    pred_path = os.path.join(WRITE_DIR, "pred.json")
+    gt_path = os.path.join(WRITE_DIR, "gt.json")
+    create_coco_eval_file(pred_path, gt_path, pred_answers, gt_answers)
+    score_compute(pred_path, gt_path, metrics=["Bleu_4", "METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
 
 
 def _run_embedding_texts_images():

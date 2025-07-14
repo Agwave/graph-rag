@@ -19,9 +19,6 @@ class ImageInfo(BaseModel):
 
 def run(client: Client, question: str, paragraphs: str, images: list[ImageInfo]):
     content = _content(question, paragraphs, images)
-    logger.info(f"question: {question}")
-    logger.info(f"paragraphs len: {len(paragraphs)}")
-    logger.info(f"images {images}")
     completion = client.chat.completions.create(
         model="qwen-vl-max-latest",
         messages=[
@@ -32,9 +29,7 @@ def run(client: Client, question: str, paragraphs: str, images: list[ImageInfo])
         ]
     )
     response = completion.choices[0].message.content
-    logger.info(f"response: {response}")
     answer = _extract_answer(response)
-    logger.info(f"answer: {answer}")
     return answer
 
 
