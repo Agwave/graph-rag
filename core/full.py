@@ -25,7 +25,7 @@ class ImageInfo(BaseModel):
 
 def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, file_tag: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
-        test_a_data = json.load(f)
+        test_data = json.load(f)
 
     logger.info(f"current tag {file_tag}")
 
@@ -33,7 +33,7 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
     skip_qa_count = fm.read_skip_count()
 
     curr_qa_count = 0
-    for paper_id, paper in test_a_data.items():
+    for paper_id, paper in test_data.items():
 
         images = []
         for image_name, image_detail in paper["all_figures"].items():
