@@ -40,7 +40,6 @@ def score_compute(pycocoeval_pred_file_path: str, pycocoeval_gt_file_path: str, 
     avg_bert_f1 = sc.mean().item()
     res["BERTScore"] = avg_bert_f1
 
-    logger.info(f"score: {res}")
     return res
 
 

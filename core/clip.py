@@ -1,4 +1,5 @@
 import torch
+from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
 from loguru import logger
