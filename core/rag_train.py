@@ -12,8 +12,19 @@ from torch.optim import Optimizer
 from core.clip import init_model_and_processor, embedding_texts, embedding_image
 
 
-def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, file_tag: str):
-    pass
+def run(client: Client, train_data_path: str, val_data_path: str, train_val_image_dir,
+        test_data_path: str, test_image_dir, paragraphs_dir: str, images_dir: str, write_dir: str, file_tag: str):
+    model_path = "output/best_alignment_model.pth"
+    model = EmbeddingAlignmentMLP(512, 512)
+    if not os.path.exists(model_path):
+        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_image_dir), batch_size=64, shuffle=True, num_workers=4)
+        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_image_dir), batch_size=64, shuffle=True, num_workers=4)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+        train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
+    else:
+        model.load_state_dict(torch.load(model_path))
+
+
 
 
 class EmbeddingAlignmentMLP(nn.Module):
@@ -41,12 +52,12 @@ class EmbeddingAlignmentMLP(nn.Module):
 
 class ImageQuestionDataset(Dataset):
 
-    def __init__(self, train_data_path: str, images_dir: str):
-        with open(train_data_path, "r", encoding="utf-8") as f:
-            train_data = json.load(f)
+    def __init__(self, data_path: str, images_dir: str):
+        with open(data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
         self.length = 0
         self.data = []
-        for paper_id, paper in train_data.items():
+        for paper_id, paper in data.items():
             self.length += len(paper["qa"])
             for qa in paper["qa"]:
                 self.data.append((qa["question"], os.path.join(images_dir, paper_id, qa["reference"])))

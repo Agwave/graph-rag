@@ -148,13 +148,13 @@ def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_
                 caption=image_detail["caption"]).model_dump()
             )
 
-        image_embedings = embedding_image(model, processor, images).cpu().numpy()
+        image_embeddings = embedding_image(model, processor, images).cpu().numpy()
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr
             indices.append(idx)
             id_to_element[str(idx)] = {"type": "image", "data": image_info}
-        index.add_with_ids(image_embedings, np.array(indices))
+        index.add_with_ids(image_embeddings, np.array(indices))
         im.write_images_index(paper_id, index)
         logger.info(f"write {paper_id} images index finish")
 
