@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as functional
 from PIL import Image
 from transformers import CLIPProcessor, CLIPModel
 
@@ -18,7 +19,7 @@ def embedding_texts(model: CLIPModel, processor: CLIPProcessor, texts: list[str]
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         text_embeddings = model.get_text_features(**inputs)
-    return text_embeddings
+    return functional.normalize(text_embeddings, dim=1)
 
 
 def embedding_image(model: CLIPModel, processor: CLIPProcessor, images: list[Image.Image]) -> torch.Tensor:
@@ -27,7 +28,7 @@ def embedding_image(model: CLIPModel, processor: CLIPProcessor, images: list[Ima
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
         image_embeddings = model.get_image_features(**inputs)
-    return image_embeddings
+    return functional.normalize(image_embeddings, dim=1)
 
 
 def trunk_by_paragraph(text: str) -> list[str]:
