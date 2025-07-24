@@ -19,21 +19,21 @@ from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
 
 
-def run(client: Client, train_data_path: str, val_data_path: str, train_val_image_dir,
-        test_data_path: str, test_image_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
+def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir,
+        test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     model_path = "output/best_alignment_model.pth"
     model = EmbeddingAlignmentMLP(512, 512)
     if not os.path.exists(model_path):
-        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_image_dir), batch_size=64,
+        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=64,
                                   shuffle=True, num_workers=4)
-        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_image_dir), batch_size=64, shuffle=True,
+        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=64, shuffle=True,
                                 num_workers=4)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
         _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
-    _run_index(model, test_data_path, paragraphs_dir, test_image_dir, write_dir, "indices")
+    _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
     _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
 
 
@@ -139,6 +139,8 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
                 logger.info("train 10 epoch no improve, early stop")
                 break
 
+        break # TODO delete
+
     logger.info("training finished")
 
 
@@ -219,7 +221,7 @@ def _run_search(model: EmbeddingAlignmentMLP,client: Client, test_data_path: str
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embeddings = model.get_images_embedding(qs).cpu().numpy()
+        qs_embeddings = model.get_texts_embedding(qs).cpu().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
         images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
 
