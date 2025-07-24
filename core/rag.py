@@ -8,6 +8,7 @@ from openai import Client
 from PIL import Image
 
 from core.clip import init_model_and_processor, trunk_by_paragraph, embedding_texts, embedding_image
+from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
 from core.llm import invoke_llm
 from core.metric import create_coco_eval_file, score_compute
@@ -23,8 +24,7 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
 
 
 def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: str, indices_dir):
-    model_name = "models/clip-vit-base-patch32"
-    model, processor = init_model_and_processor(model_name)
+    model, processor = init_model_and_processor(CLIP_MODEL_PATH)
 
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
@@ -44,7 +44,7 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embeddings = embedding_texts(model, processor, qs)
+        qs_embeddings = embedding_texts(model, processor, qs).cpu().detach().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
         images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
 
@@ -105,8 +105,7 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
 
 
 def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, indices_dir):
-    model_name = "models/clip-vit-base-patch32"
-    model, processor = init_model_and_processor(model_name)
+    model, processor = init_model_and_processor(CLIP_MODEL_PATH)
 
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
@@ -124,7 +123,7 @@ def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_
         texts = trunk_by_paragraph(text)
         logger.info(f"paragraphs: {text[:100]}...")
 
-        text_embeddings = embedding_texts(model, processor, texts).cpu().numpy()
+        text_embeddings = embedding_texts(model, processor, texts).cpu().detach().numpy()
         indices = []
         for i, text in enumerate(texts):
             idx = i + curr
@@ -148,7 +147,7 @@ def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_
                 caption=image_detail["caption"]).model_dump()
             )
 
-        image_embeddings = embedding_image(model, processor, images).cpu().numpy()
+        image_embeddings = embedding_image(model, processor, images).cpu().detach().numpy()
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr

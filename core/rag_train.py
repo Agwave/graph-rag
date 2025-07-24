@@ -12,6 +12,7 @@ from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
 
 from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
+from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
 from core.llm import invoke_llm
 from core.metric import create_coco_eval_file, score_compute
@@ -22,12 +23,12 @@ from core.prompt import ImageInfo
 def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     model_path = "output/best_alignment_model.pth"
-    model = EmbeddingAlignmentMLP(512, 512)
+    model = EmbeddingAlignmentMLP(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
         train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=64,
-                                  shuffle=True, num_workers=4)
+                                  shuffle=True, num_workers=1, collate_fn=_custom_collate_fn)
         val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=64, shuffle=True,
-                                num_workers=4)
+                                num_workers=1, collate_fn=_custom_collate_fn)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
         _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
     else:
@@ -49,8 +50,7 @@ class EmbeddingAlignmentMLP(nn.Module):
             nn.Linear(input_dim, output_dim),
             nn.ReLU()
         )
-        clip_model_name = "models/clip-vit-base-patch32"
-        self.clip_model, self.clip_processor = init_model_and_processor(clip_model_name)
+        self.clip_model, self.clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
 
     def get_texts_embedding(self, texts: list[str]):
         texts_embeddings = embedding_texts(self.clip_model, self.clip_processor, texts)
@@ -91,6 +91,12 @@ class ImageQuestionDataset(Dataset):
         return question, image
 
 
+def _custom_collate_fn(batch):
+    questions = [item[0] for item in batch]
+    images = [item[1] for item in batch]
+    return questions, images
+
+
 def _info_nce_loss(questions_embedding: torch.Tensor, images_embedding: torch.Tensor, temperature: float = 0.07):
     similarity_matrix = torch.matmul(questions_embedding, images_embedding.T) / temperature
     logit_positive_pairs = torch.diag(similarity_matrix)
@@ -115,6 +121,7 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+            break # TODO delete
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
 
@@ -125,6 +132,7 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
                 qs_emb, is_emb = model(questions, images)
                 loss = _info_nce_loss(qs_emb, is_emb, temperature)
                 val_loss += loss.item()
+                break  # TODO delete
         avg_val_loss = val_loss / len(val_loader)
         logger.info(f"validation Loss: {avg_val_loss:.4f}")
 
@@ -163,7 +171,7 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
         texts = trunk_by_paragraph(text)
         logger.info(f"paragraphs: {text[:100]}...")
 
-        text_embeddings = model.get_texts_embedding(texts).cpu().numpy()
+        text_embeddings = model.get_texts_embedding(texts).cpu().detach().numpy()
         indices = []
         for i, text in enumerate(texts):
             idx = i + curr
@@ -187,7 +195,7 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
                 caption=image_detail["caption"]).model_dump()
                                )
 
-        image_embeddings = model.get_images_embedding(images).cpu().numpy()
+        image_embeddings = model.get_images_embedding(images).cpu().detach().numpy()
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr
@@ -221,7 +229,7 @@ def _run_search(model: EmbeddingAlignmentMLP,client: Client, test_data_path: str
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embeddings = model.get_texts_embedding(qs).cpu().numpy()
+        qs_embeddings = model.get_texts_embedding(qs).cpu().detach().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
         images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
 
