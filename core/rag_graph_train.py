@@ -1,5 +1,6 @@
 import json
 import os
+from typing import Optional, Callable
 
 import faiss
 import numpy as np
@@ -8,8 +9,9 @@ import torch.nn as nn
 from loguru import logger
 from openai import Client
 from PIL import Image
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import Optimizer
+from torch.optim.optimizer import Optimizer
+from torch_geometric.data import Data, Dataset
+from torch_geometric.loader import DataLoader
 
 from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH
@@ -20,28 +22,10 @@ from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
 
 
-def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
-        test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
-    model_path = "output/best_alignment_model.pth"
-    model = EmbeddingAlignmentMLP(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(model_path):
-        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=64,
-                                  shuffle=True, num_workers=1, collate_fn=_custom_collate_fn)
-        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=64, shuffle=True,
-                                num_workers=1, collate_fn=_custom_collate_fn)
-        opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-        _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
-    else:
-        model.load_state_dict(torch.load(model_path))
+class EmbeddingAlignmentGNN(nn.Module):
 
-    _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
-    _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
-
-
-class EmbeddingAlignmentMLP(nn.Module):
-
-    def __init__(self, input_dim, output_dim):
-        super(EmbeddingAlignmentMLP, self).__init__()
+    def __init__(self, input_dim: int, output_dim: int):
+        super(EmbeddingAlignmentGNN, self).__init__()
         self.image_branch = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.ReLU()
@@ -62,98 +46,101 @@ class EmbeddingAlignmentMLP(nn.Module):
         aligned_images_embedding = self.image_branch(images_embedding)
         return aligned_images_embedding
 
-    def forward(self, questions: list[str], images: list[Image.Image]):
-        questions_embedding = embedding_texts(self.clip_model, self.clip_processor, questions)
-        images_embedding = embedding_image(self.clip_model, self.clip_processor, images)
-        aligned_questions_embedding = self.text_branch(questions_embedding)
-        aligned_images_embedding = self.image_branch(images_embedding)
-        return aligned_questions_embedding, aligned_images_embedding
+    def forward(self, data: Data):
+        ## 这里需要做的是过了gnn之后，使用图片索引获取到向量，然后与问题向量进行对比学习和损失计算
+        pass
 
 
-class ImageQuestionDataset(Dataset):
+class GraphDataset(Dataset):
 
-    def __init__(self, data_path: str, images_dir: str):
-        with open(data_path, "r", encoding="utf-8") as f:
+    ## 原始数据是 json 图片 文本
+    ## 目标数据是 torch_geometric 的 graph
+    ## 使用 clip 对文本段、图片、问题进行嵌入，然后构图，Data 中维护一系列问题向量、一系列图片索引（名称包含index以字段转换成单个batch的全局索引）
+    ## 输出的 dataset 需要的东西：
+
+    def __init__(self,
+                 data_path: str,
+                 images_dir: str,
+                 paragraphs_dir: str,
+                 root: Optional[str] = None,
+                 transform: Optional[Callable] = None,
+                 pre_transform: Optional[Callable] = None,
+                 pre_filter: Optional[Callable] = None):
+        super().__init__(root=root, transform=transform, pre_transform=pre_transform, pre_filter=pre_filter)
+        self.data_path = data_path
+        self.images_dir = images_dir
+        self.paragraphs_dir = paragraphs_dir
+
+    @property
+    def raw_file_names(self):
+        return []
+
+    @property
+    def processed_file_names(self):
+        return []
+
+    def download(self):
+        pass
+
+    def process(self):
+        with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        self.length = 0
-        self.data = []
+        idx = 0
         for paper_id, paper in data.items():
-            self.length += len(paper["qa"])
-            for qa in paper["qa"]:
-                self.data.append((qa["question"], os.path.join(images_dir, paper_id, qa["reference"])))
+            paragraphs_file_path = os.path.join(self.paragraphs_dir, f"{paper_id}.txt")
+            text = read_text_file(paragraphs_file_path)
+            texts = trunk_by_paragraph(text)
+            logger.info(f"paragraphs: {text[:100]}...")
 
-    def __len__(self):
-        return self.length
+            images_info = []
+            for image_name, image_detail in paper["all_figures"].items():
+                images_info.append(ImageInfo(
+                    type="image/png",
+                    name=image_name,
+                    path=os.path.join(self.images_dir, paper_id, image_name),
+                    caption=image_detail["caption"]))
 
-    def __getitem__(self, idx):
-        question, image_path = self.data[idx]
-        image = Image.open(image_path).convert("RGB")
-        return question, image
+            graph = _make_graph(texts, images_info)
+            torch.save(graph, os.path.join(self.processed_dir, f"data_{idx}.pt"))
+            idx += 1
+
+    def len(self):
+        return len(self.processed_file_names)
+
+    def get(self, idx):
+        data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"))
+        return data
 
 
-def _custom_collate_fn(batch):
-    questions = [item[0] for item in batch]
-    images = [item[1] for item in batch]
-    return questions, images
+def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir,
+        test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
+    model_path = "output/best_gnn_model.pth"
+    model = EmbeddingAlignmentGNN(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
+    if not os.path.exists(model_path):
+        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir), batch_size=2,
+                                  shuffle=True, num_workers=1)
+        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir), batch_size=2,
+                                shuffle=False, num_workers=1)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4)
+        _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
+    else:
+        model.load_state_dict(torch.load(model_path))
 
-
-def _info_nce_loss(questions_embedding: torch.Tensor, images_embedding: torch.Tensor, temperature: float = 0.07):
-    similarity_matrix = torch.matmul(questions_embedding, images_embedding.T) / temperature
-    logit_positive_pairs = torch.diag(similarity_matrix)
-    exp_logits = torch.exp(similarity_matrix)
-    sum_exp_logits = exp_logits.sum(dim=1)
-    loss = - (logit_positive_pairs - torch.log(sum_exp_logits)).mean()
-    return loss
+    _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
+    _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
 
 
 def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
-    best_val_loss = float("inf")
-    not_improve = 0
-    for epoch in range(epochs):
-
-        model.train()
-        train_loss = 0
-        for batch_idx, (questions, images) in enumerate(train_loader):
-            optimizer.zero_grad()
-            qs_emb, is_emb = model(questions, images)
-            loss = _info_nce_loss(qs_emb, is_emb, temperature)
-            loss.backward()
-            optimizer.step()
-            train_loss += loss.item()
-            break  # TODO delete
-        avg_train_loss = train_loss / len(train_loader)
-        logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
-
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch_idx, (questions, images) in enumerate(val_loader):
-                qs_emb, is_emb = model(questions, images)
-                loss = _info_nce_loss(qs_emb, is_emb, temperature)
-                val_loss += loss.item()
-                break  # TODO delete
-        avg_val_loss = val_loss / len(val_loader)
-        logger.info(f"validation Loss: {avg_val_loss:.4f}")
-
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "output/best_alignment_model.pth")
-            logger.info(f"saved best model with Validation Loss: {best_val_loss:.4f}")
-            not_improve = 0
-        else:
-            not_improve += 1
-            if not_improve >= 10:
-                logger.info("train 10 epoch no improve, early stop")
-                break
-
-        break  # TODO delete
-
-    logger.info("training finished")
+    pass
 
 
-def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
+def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
                indices_dir: str):
+    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir), batch_size=2, shuffle=False, num_workers=1)
+    for batch_idx, graph_data in enumerate(test_loader):
+        pass
+
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
     if not os.path.exists(os.path.join(write_dir, indices_dir)):
@@ -209,8 +196,8 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
         break  # TODO delete
 
 
-def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: str, write_dir: str, file_tag: str,
-                indices_dir: str):
+def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: str, write_dir: str, file_tag: str,
+                indices_dir):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -287,3 +274,7 @@ def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: st
     score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
     logger.info(f"score: {score}")
     fm.write_metric(score)
+
+
+def _make_graph(texts: list[str], images_info: list[ImageInfo]) -> Data:
+    pass
