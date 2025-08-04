@@ -191,8 +191,7 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
                 type="image/png",
                 name=image_name,
                 path=os.path.join(images_dir, paper_id, image_name),
-                caption=image_detail["caption"]).model_dump()
-                               )
+                caption=image_detail["caption"]).model_dump())
 
         image_embeddings = model.get_images_embedding(images).cpu().detach().numpy()
         indices = []

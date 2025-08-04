@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, Any
 
 import faiss
 import numpy as np
@@ -12,6 +12,8 @@ from PIL import Image
 from torch.optim.optimizer import Optimizer
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
+from transformers import CLIPModel, CLIPProcessor
+from triton.language import dtype
 
 from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH
@@ -51,12 +53,30 @@ class EmbeddingAlignmentGNN(nn.Module):
         pass
 
 
-class GraphDataset(Dataset):
+class GraphData(Data):
 
-    ## 原始数据是 json 图片 文本
-    ## 目标数据是 torch_geometric 的 graph
-    ## 使用 clip 对文本段、图片、问题进行嵌入，然后构图，Data 中维护一系列问题向量、一系列图片索引（名称包含index以字段转换成单个batch的全局索引）
-    ## 输出的 dataset 需要的东西：
+    def __init__(self,
+                 x: Optional[torch.Tensor] = None,
+                 edge_index: Optional[torch.Tensor] = None,
+                 image_index: Optional[torch.Tensor] = None,
+                 questions_embedding: Optional[torch.Tensor] = None,
+                 **kwargs
+                 ):
+        super().__init__(x=x, edge_index=edge_index, image_index=image_index, questions_embedding=questions_embedding, **kwargs)
+
+    def __inc__(self, key, value, *args, **kwargs):
+        if key == "edge_index" or key == "image_index":
+            return self.x.size(0)
+        return 0
+
+    def __cat_dim__(self, key, value, *args, **kwargs):
+        if key == "edge_index":
+            return 1
+        else:
+            return 0
+
+
+class GraphDataset(Dataset):
 
     def __init__(self,
                  data_path: str,
@@ -77,12 +97,15 @@ class GraphDataset(Dataset):
 
     @property
     def processed_file_names(self):
-        return []
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return [f"data_{idx}.pt" for idx in range(len(data))]
 
     def download(self):
         pass
 
     def process(self):
+        clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
         with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         idx = 0
@@ -100,7 +123,11 @@ class GraphDataset(Dataset):
                     path=os.path.join(self.images_dir, paper_id, image_name),
                     caption=image_detail["caption"]))
 
-            graph = _make_graph(texts, images_info)
+            question_image_name_pair = []
+            for qa in paper["qa"]:
+                question_image_name_pair.append([qa["question"], qa["reference"]])
+
+            graph = _make_graph(clip_model, clip_processor, texts, images_info, question_image_name_pair)
             torch.save(graph, os.path.join(self.processed_dir, f"data_{idx}.pt"))
             idx += 1
 
@@ -117,9 +144,9 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model_path = "output/best_gnn_model.pth"
     model = EmbeddingAlignmentGNN(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
-        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir), batch_size=2,
+        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir), batch_size=2,
                                   shuffle=True, num_workers=1)
-        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir), batch_size=2,
+        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir), batch_size=2,
                                 shuffle=False, num_workers=1)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
         _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
@@ -137,7 +164,8 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
                indices_dir: str):
-    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir), batch_size=2, shuffle=False, num_workers=1)
+    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir, paragraphs_dir), batch_size=2, shuffle=False,
+                             num_workers=1)
     for batch_idx, graph_data in enumerate(test_loader):
         pass
 
@@ -276,5 +304,41 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
     fm.write_metric(score)
 
 
-def _make_graph(texts: list[str], images_info: list[ImageInfo]) -> Data:
-    pass
+def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: list[str],
+                images_info: list[ImageInfo], question_image_name_pair: list[list[str]]) -> Data:
+    images = []
+    for image_info in images_info:
+        images.append(Image.open(image_info.path).convert("RGB"))
+    texts_feature = embedding_texts(clip_model, clip_processor, texts)
+    images_feature = embedding_image(clip_model, clip_processor, images)
+    x = torch.concat([texts_feature, images_feature], 0)
+
+    edges = []
+    for i in range(len(texts) - 1):
+        edges.append([i, i + 1])
+        edges.append([i + 1, i])
+    for j, image_info in enumerate(images_info):
+        caption_title = image_info.name.split("-")[1]
+        alpha, numeric = _split_alpha_numeric_loop(caption_title)
+        possible_caption_title = [alpha + " " + numeric, alpha[:3] + ". " + numeric]
+        for i, text in enumerate(texts):
+            has_caption_title = False
+            for title in possible_caption_title:
+                if title in text:
+                    has_caption_title = True
+                    break
+            if has_caption_title:
+                edges.append([i, j + len(texts)])
+                edges.append([j + len(texts), i])
+    edge_index = torch.tensor(edges, dtype=torch.long).t()
+
+    questions_embedding = embedding_texts(clip_model, clip_processor, [p[0] for p in question_image_name_pair])
+    image_index = torch.tensor([p[1] for p in question_image_name_pair], dtype=torch.long)
+
+    return Data(x, edge_index, image_index=image_index, questions_embedding=questions_embedding)
+
+
+def _split_alpha_numeric_loop(text):
+    for i, char in enumerate(text):
+        if char.isdigit():
+            return text[:i], text[i:]
