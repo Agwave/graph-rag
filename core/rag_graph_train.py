@@ -53,29 +53,6 @@ class EmbeddingAlignmentGNN(nn.Module):
         pass
 
 
-class GraphData(Data):
-
-    def __init__(self,
-                 x: Optional[torch.Tensor] = None,
-                 edge_index: Optional[torch.Tensor] = None,
-                 image_index: Optional[torch.Tensor] = None,
-                 questions_embedding: Optional[torch.Tensor] = None,
-                 **kwargs
-                 ):
-        super().__init__(x=x, edge_index=edge_index, image_index=image_index, questions_embedding=questions_embedding, **kwargs)
-
-    def __inc__(self, key, value, *args, **kwargs):
-        if key == "edge_index" or key == "image_index":
-            return self.x.size(0)
-        return 0
-
-    def __cat_dim__(self, key, value, *args, **kwargs):
-        if key == "edge_index":
-            return 1
-        else:
-            return 0
-
-
 class GraphDataset(Dataset):
 
     def __init__(self,
@@ -127,7 +104,7 @@ class GraphDataset(Dataset):
             for qa in paper["qa"]:
                 question_image_name_pair.append([qa["question"], qa["reference"]])
 
-            graph = _make_graph(clip_model, clip_processor, texts, images_info, question_image_name_pair)
+            graph = _make_graph(clip_model, clip_processor, texts, images_info, question_image_name_pair, paper_id)
             torch.save(graph, os.path.join(self.processed_dir, f"data_{idx}.pt"))
             idx += 1
 
@@ -166,10 +143,10 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
         model.train()
         train_loss = 0
         for batch_idx, graph_data in enumerate(train_loader):
-            graph_data: GraphData = graph_data
+            graph_data: Data = graph_data
             optimizer.zero_grad()
             x_updated = model(graph_data)
-            images_embedding = x_updated[graph_data.image_index]
+            images_embedding = x_updated[graph_data.images_index]
             loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
             loss.backward()
             optimizer.step()
@@ -182,9 +159,9 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
         val_loss = 0
         with torch.no_grad():
             for batch_idx, graph_data in enumerate(val_loader):
-                graph_data: GraphData = graph_data
+                graph_data: Data = graph_data
                 x_updated = model(graph_data)
-                images_embedding = x_updated[graph_data.image_index]
+                images_embedding = x_updated[graph_data.images_index]
                 loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
                 val_loss += loss.item()
                 break  # TODO delete
@@ -210,60 +187,39 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
                indices_dir: str):
+    im = IndexFileManager(write_dir, indices_dir)
     test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir, paragraphs_dir), batch_size=2, shuffle=False,
                              num_workers=1)
     for batch_idx, graph_data in enumerate(test_loader):
-        pass
-
-    with open(test_data_path, "r", encoding="utf-8") as f:
-        test_data = json.load(f)
-    if not os.path.exists(os.path.join(write_dir, indices_dir)):
-        os.makedirs(os.path.join(write_dir, indices_dir))
-
-    im = IndexFileManager(write_dir, indices_dir)
-    for paper_id, paper in test_data.items():
         id_to_element = dict()
+        indices = []
         curr = 0
 
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-        paragraphs_file_path = os.path.join(paragraphs_dir, f"{paper_id}.txt")
-        text = read_text_file(paragraphs_file_path)
-        texts = trunk_by_paragraph(text)
-        logger.info(f"paragraphs: {text[:100]}...")
+        graph_data: Data = graph_data
+        paper_id = graph_data.paper_id
+        x_updated = model(graph_data)
 
-        text_embeddings = model.get_texts_embedding(texts).cpu().detach().numpy()
-        indices = []
-        for i, text in enumerate(texts):
+        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+        texts_embedding = x_updated[graph_data.texts_index].cpu().detach().numpy()
+        for i, text in enumerate(graph_data.texts):
             idx = i + curr
             indices.append(idx)
             id_to_element[idx] = {"type": "text", "data": text}
-        index.add_with_ids(text_embeddings, np.array(indices))
-        curr += len(texts)
-        im.write_texts_index(paper_id, index)
+        index.add_with_ids(texts_embedding, np.array(indices))
+        curr += len(graph_data.texts)
+        im.write_texts_index(texts_embedding, index)
         logger.info(f"write {paper_id} texts index finish")
 
         index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-        images = []
-        images_info = []
-        for image_name, image_detail in paper["all_figures"].items():
-            img = Image.open(os.path.join(images_dir, paper_id, image_name)).convert("RGB")
-            images.append(img)
-            images_info.append(ImageInfo(
-                type="image/png",
-                name=image_name,
-                path=os.path.join(images_dir, paper_id, image_name),
-                caption=image_detail["caption"]).model_dump()
-                               )
-
-        image_embeddings = model.get_images_embedding(images).cpu().detach().numpy()
+        images_embedding = x_updated[graph_data.images_index].cpu().detach().numpy()
         indices = []
-        for i, image_info in enumerate(images_info):
+        for i, image_info in enumerate(graph_data.images_info):
             idx = i + curr
             indices.append(idx)
-            id_to_element[str(idx)] = {"type": "image", "data": image_info}
-        index.add_with_ids(image_embeddings, np.array(indices))
+            id_to_element[str(idx)] = {"type": "image", "data": image_info.model_dump()}
+        index.add_with_ids(images_embedding, np.array(indices))
         im.write_images_index(paper_id, index)
-        logger.info(f"write {paper_id} images index finish")
+        logger.info(f"write {graph_data.paper_id} images index finish")
 
         im.write_id_to_element(paper_id, id_to_element)
         logger.info(f"write {paper_id} id_to_element json finish")
@@ -351,7 +307,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
 
 
 def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: list[str],
-                images_info: list[ImageInfo], question_image_name_pair: list[list[str]]) -> Data:
+                images_info: list[ImageInfo], question_image_name_pair: list[list[str]], paper_id: str) -> Data:
     images = []
     for image_info in images_info:
         images.append(Image.open(image_info.path).convert("RGB"))
@@ -379,9 +335,11 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
     edge_index = torch.tensor(edges, dtype=torch.long).t()
 
     questions_embedding = embedding_texts(clip_model, clip_processor, [p[0] for p in question_image_name_pair])
-    image_index = torch.tensor([p[1] for p in question_image_name_pair], dtype=torch.long)
+    images_index = torch.tensor([len(texts) + i for i in range(len(images))], dtype=torch.long)
+    texts_index = torch.tensor([i for i in range(len(texts))], dtype=torch.long)
 
-    return Data(x, edge_index, image_index=image_index, questions_embedding=questions_embedding)
+    return Data(x, edge_index, images_index=images_index, texts_index=texts_index,
+                questions_embedding=questions_embedding, images_info=images_info, texts=texts, paper_id=paper_id)
 
 
 def _split_alpha_numeric_loop(text):
