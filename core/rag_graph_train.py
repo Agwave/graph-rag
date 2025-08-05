@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Optional, Callable, Union, Any
+from typing import Optional, Callable
 
 import faiss
 import numpy as np
@@ -13,7 +13,6 @@ from torch.optim.optimizer import Optimizer
 from torch_geometric.data import Data, Dataset
 from torch_geometric.loader import DataLoader
 from transformers import CLIPModel, CLIPProcessor
-from triton.language import dtype
 
 from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH
@@ -22,6 +21,7 @@ from core.llm import invoke_llm
 from core.metric import create_coco_eval_file, score_compute
 from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
+from core.train import info_nce_loss
 
 
 class EmbeddingAlignmentGNN(nn.Module):
@@ -159,7 +159,53 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
 
 def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
-    pass
+    best_val_loss = float("inf")
+    not_improve = 0
+    for epoch in range(epochs):
+
+        model.train()
+        train_loss = 0
+        for batch_idx, graph_data in enumerate(train_loader):
+            graph_data: GraphData = graph_data
+            optimizer.zero_grad()
+            x_updated = model(graph_data)
+            images_embedding = x_updated[graph_data.image_index]
+            loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
+            loss.backward()
+            optimizer.step()
+            train_loss += loss.item()
+            break  # TODO delete
+        avg_train_loss = train_loss / len(train_loader)
+        logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
+
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for batch_idx, graph_data in enumerate(val_loader):
+                graph_data: GraphData = graph_data
+                x_updated = model(graph_data)
+                images_embedding = x_updated[graph_data.image_index]
+                loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
+                val_loss += loss.item()
+                break  # TODO delete
+        avg_val_loss = val_loss / len(val_loader)
+        logger.info(f"validation Loss: {avg_val_loss:.4f}")
+
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            torch.save(model.state_dict(), "output/best_gnn_model.pth")
+            logger.info(f"saved best model with Validation Loss: {best_val_loss:.4f}")
+            not_improve = 0
+        else:
+            not_improve += 1
+            if not_improve >= 10:
+                logger.info("train 10 epoch no improve, early stop")
+                break
+
+        break  # TODO delete
+
+    logger.info("training finished")
+
 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
