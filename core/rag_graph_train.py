@@ -6,16 +6,18 @@ import faiss
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as functional
 from loguru import logger
 from openai import Client
 from PIL import Image
 from torch.optim.optimizer import Optimizer
 from torch_geometric.data import Data, Dataset
+from torch_geometric.nn.conv import GCNConv
 from torch_geometric.loader import DataLoader
 from transformers import CLIPModel, CLIPProcessor
 
 from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
-from core.conf import CLIP_MODEL_PATH
+from core.conf import CLIP_MODEL_PATH, ROOT_DIR
 from core.data import read_text_file
 from core.llm import invoke_llm
 from core.metric import create_coco_eval_file, score_compute
@@ -28,29 +30,19 @@ class EmbeddingAlignmentGNN(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int):
         super(EmbeddingAlignmentGNN, self).__init__()
-        self.image_branch = nn.Sequential(
+        self.linear = nn.Sequential(
             nn.Linear(input_dim, output_dim),
             nn.ReLU()
         )
-        self.text_branch = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU()
-        )
-        self.clip_model, self.clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
+        self.conv1 = GCNConv(output_dim, output_dim)
+        self.conv2 = GCNConv(output_dim, output_dim)
 
-    def get_texts_embedding(self, texts: list[str]):
-        texts_embeddings = embedding_texts(self.clip_model, self.clip_processor, texts)
-        aligned_texts_embedding = self.text_branch(texts_embeddings)
-        return aligned_texts_embedding
-
-    def get_images_embedding(self, images: list[Image.Image]):
-        images_embedding = embedding_image(self.clip_model, self.clip_processor, images)
-        aligned_images_embedding = self.image_branch(images_embedding)
-        return aligned_images_embedding
-
-    def forward(self, data: Data):
-        ## 这里需要做的是过了gnn之后，使用图片索引获取到向量，然后与问题向量进行对比学习和损失计算
-        pass
+    def forward(self, x, edge_index):
+        x = self.linear(x)
+        x = self.conv1(x, edge_index)
+        x = functional.relu(x)
+        x = self.conv2(x, edge_index)
+        return x
 
 
 class GraphDataset(Dataset):
@@ -63,10 +55,10 @@ class GraphDataset(Dataset):
                  transform: Optional[Callable] = None,
                  pre_transform: Optional[Callable] = None,
                  pre_filter: Optional[Callable] = None):
-        super().__init__(root=root, transform=transform, pre_transform=pre_transform, pre_filter=pre_filter)
         self.data_path = data_path
         self.images_dir = images_dir
         self.paragraphs_dir = paragraphs_dir
+        super().__init__(root=root, transform=transform, pre_transform=pre_transform, pre_filter=pre_filter)
 
     @property
     def raw_file_names(self):
@@ -87,6 +79,11 @@ class GraphDataset(Dataset):
             data = json.load(f)
         idx = 0
         for paper_id, paper in data.items():
+            target_file_path = os.path.join(self.processed_dir, f"data_{idx}.pt")
+            if os.path.exists(target_file_path):
+                idx += 1
+                continue
+
             paragraphs_file_path = os.path.join(self.paragraphs_dir, f"{paper_id}.txt")
             text = read_text_file(paragraphs_file_path)
             texts = trunk_by_paragraph(text)
@@ -105,7 +102,7 @@ class GraphDataset(Dataset):
                 question_image_name_pair.append([qa["question"], qa["reference"]])
 
             graph = _make_graph(clip_model, clip_processor, texts, images_info, question_image_name_pair, paper_id)
-            torch.save(graph, os.path.join(self.processed_dir, f"data_{idx}.pt"))
+            torch.save(graph, target_file_path)
             idx += 1
 
     def len(self):
@@ -116,14 +113,14 @@ class GraphDataset(Dataset):
         return data
 
 
-def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir,
+def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     model_path = "output/best_gnn_model.pth"
     model = EmbeddingAlignmentGNN(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
-        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir), batch_size=2,
+        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir, ROOT_DIR), batch_size=2,
                                   shuffle=True, num_workers=1)
-        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir), batch_size=2,
+        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir, ROOT_DIR), batch_size=2,
                                 shuffle=False, num_workers=1)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
         _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
@@ -134,7 +131,7 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
 
 
-def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
+def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0
@@ -145,9 +142,10 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
         for batch_idx, graph_data in enumerate(train_loader):
             graph_data: Data = graph_data
             optimizer.zero_grad()
-            x_updated = model(graph_data)
+            x_updated = model(graph_data.x, graph_data.edge_index)
             images_embedding = x_updated[graph_data.images_index]
-            loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
+            questions_embedding = model.linear(graph_data.questions_embedding)
+            loss = info_nce_loss(questions_embedding, images_embedding, temperature)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
@@ -160,9 +158,10 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
         with torch.no_grad():
             for batch_idx, graph_data in enumerate(val_loader):
                 graph_data: Data = graph_data
-                x_updated = model(graph_data)
+                x_updated = model(graph_data.x, graph_data.edge_index)
                 images_embedding = x_updated[graph_data.images_index]
-                loss = info_nce_loss(graph_data.questions_embedding, images_embedding, temperature)
+                questions_embedding = model.linear(graph_data.questions_embedding)
+                loss = info_nce_loss(questions_embedding, images_embedding, temperature)
                 val_loss += loss.item()
                 break  # TODO delete
         avg_val_loss = val_loss / len(val_loader)
@@ -188,7 +187,7 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
                indices_dir: str):
     im = IndexFileManager(write_dir, indices_dir)
-    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir, paragraphs_dir), batch_size=2, shuffle=False,
+    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir, paragraphs_dir, ROOT_DIR), batch_size=2, shuffle=False,
                              num_workers=1)
     for batch_idx, graph_data in enumerate(test_loader):
         id_to_element = dict()
@@ -197,7 +196,7 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir
 
         graph_data: Data = graph_data
         paper_id = graph_data.paper_id
-        x_updated = model(graph_data)
+        x_updated = model(graph_data.x, graph_data.edge_index)
 
         index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
         texts_embedding = x_updated[graph_data.texts_index].cpu().detach().numpy()
@@ -228,6 +227,7 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir
 
 def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: str, write_dir: str, file_tag: str,
                 indices_dir):
+    clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -246,7 +246,8 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embeddings = model.get_texts_embedding(qs).cpu().detach().numpy()
+        qs_embeddings = embedding_texts(clip_model, clip_processor, qs)
+        qs_embeddings = model.linear(qs_embeddings).cpu().detach().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
         images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
 
@@ -320,7 +321,8 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
         edges.append([i, i + 1])
         edges.append([i + 1, i])
     for j, image_info in enumerate(images_info):
-        caption_title = image_info.name.split("-")[1]
+        logger.debug(f"image_info.name {image_info.name}")
+        caption_title = "-".join(image_info.name.split("-")[1:-1])
         alpha, numeric = _split_alpha_numeric_loop(caption_title)
         possible_caption_title = [alpha + " " + numeric, alpha[:3] + ". " + numeric]
         for i, text in enumerate(texts):
@@ -330,6 +332,7 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
                     has_caption_title = True
                     break
             if has_caption_title:
+                logger.debug(f"find caption title: {possible_caption_title}")
                 edges.append([i, j + len(texts)])
                 edges.append([j + len(texts), i])
     edge_index = torch.tensor(edges, dtype=torch.long).t()
@@ -343,6 +346,8 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
 
 
 def _split_alpha_numeric_loop(text):
-    for i, char in enumerate(text):
-        if char.isdigit():
-            return text[:i], text[i:]
+    if text.startswith("Figure"):
+        return text[:6], text[6:]
+    elif text.startswith("Table"):
+        return text[:5], text[5:]
+    logger.error(f"_split_alpha_numeric_loop unexpect text: {text}")
