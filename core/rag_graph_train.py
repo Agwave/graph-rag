@@ -51,6 +51,8 @@ class GraphDataset(Dataset):
                  data_path: str,
                  images_dir: str,
                  paragraphs_dir: str,
+                 clip_model: CLIPModel,
+                 clip_processor: CLIPProcessor,
                  root: Optional[str] = None,
                  transform: Optional[Callable] = None,
                  pre_transform: Optional[Callable] = None,
@@ -58,6 +60,8 @@ class GraphDataset(Dataset):
         self.data_path = data_path
         self.images_dir = images_dir
         self.paragraphs_dir = paragraphs_dir
+        self.clip_model = clip_model
+        self.clip_processor = clip_processor
         super().__init__(root=root, transform=transform, pre_transform=pre_transform, pre_filter=pre_filter)
 
     @property
@@ -68,17 +72,19 @@ class GraphDataset(Dataset):
     def processed_file_names(self):
         with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return [f"data_{idx}.pt" for idx in range(len(data))]
+        return [f"data_{idx}.pt" for idx in range(10)]
 
     def download(self):
         pass
 
     def process(self):
-        clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
         with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         idx = 0
-        for paper_id, paper in data.items():
+        for paper_id, paper in sorted(data.items()):
+            if idx >= 10:  # TODO delete
+                break
+
             target_file_path = os.path.join(self.processed_dir, f"data_{idx}.pt")
             if os.path.exists(target_file_path):
                 idx += 1
@@ -87,7 +93,6 @@ class GraphDataset(Dataset):
             paragraphs_file_path = os.path.join(self.paragraphs_dir, f"{paper_id}.txt")
             text = read_text_file(paragraphs_file_path)
             texts = trunk_by_paragraph(text)
-            logger.info(f"paragraphs: {text[:100]}...")
 
             images_info = []
             for image_name, image_detail in paper["all_figures"].items():
@@ -101,7 +106,7 @@ class GraphDataset(Dataset):
             for qa in paper["qa"]:
                 question_image_name_pair.append([qa["question"], qa["reference"]])
 
-            graph = _make_graph(clip_model, clip_processor, texts, images_info, question_image_name_pair, paper_id)
+            graph = _make_graph(self.clip_model, self.clip_processor, texts, images_info, question_image_name_pair, paper_id)
             torch.save(graph, target_file_path)
             idx += 1
 
@@ -109,7 +114,7 @@ class GraphDataset(Dataset):
         return len(self.processed_file_names)
 
     def get(self, idx):
-        data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"))
+        data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"), weights_only=False)
         return data
 
 
@@ -118,10 +123,13 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model_path = "output/best_gnn_model.pth"
     model = EmbeddingAlignmentGNN(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
-        train_loader = DataLoader(dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir, ROOT_DIR), batch_size=2,
-                                  shuffle=True, num_workers=1)
-        val_loader = DataLoader(dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir, ROOT_DIR), batch_size=2,
-                                shuffle=False, num_workers=1)
+        clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
+        train_loader = DataLoader(dataset=GraphDataset(
+            train_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
+            batch_size=2, shuffle=True, num_workers=1)
+        val_loader = DataLoader(dataset=GraphDataset(
+            val_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
+            batch_size=2, shuffle=False, num_workers=1)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
         _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
     else:
@@ -186,42 +194,52 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
                indices_dir: str):
+    if not os.path.exists(os.path.join(write_dir, indices_dir)):
+        os.makedirs(os.path.join(write_dir, indices_dir))
     im = IndexFileManager(write_dir, indices_dir)
-    test_loader = DataLoader(dataset=GraphDataset(test_data_path, images_dir, paragraphs_dir, ROOT_DIR), batch_size=2, shuffle=False,
-                             num_workers=1)
+    clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
+    test_loader = DataLoader(dataset=GraphDataset(
+        test_data_path, images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
+        batch_size=2, shuffle=False, num_workers=1)
     for batch_idx, graph_data in enumerate(test_loader):
-        id_to_element = dict()
-        indices = []
-        curr = 0
-
         graph_data: Data = graph_data
-        paper_id = graph_data.paper_id
         x_updated = model(graph_data.x, graph_data.edge_index)
+        texts_start_index, images_start_index = 0, 0
+        logger.info(f"texts len {len(graph_data.texts)}")
+        for i in range(len(graph_data.paper_id)):
+            curr = 0
+            paper_id = graph_data.paper_id[i]
+            texts = graph_data.texts[i]
+            images_info = graph_data.images_info[i]
+            texts_embedding = x_updated[graph_data.texts_index[texts_start_index:texts_start_index + len(texts)]].cpu().detach().numpy()
+            images_embedding = x_updated[graph_data.images_index[images_start_index:images_start_index + len(images_info)]].cpu().detach().numpy()
+            texts_start_index += len(texts)
+            images_start_index += len(images_info)
 
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-        texts_embedding = x_updated[graph_data.texts_index].cpu().detach().numpy()
-        for i, text in enumerate(graph_data.texts):
-            idx = i + curr
-            indices.append(idx)
-            id_to_element[idx] = {"type": "text", "data": text}
-        index.add_with_ids(texts_embedding, np.array(indices))
-        curr += len(graph_data.texts)
-        im.write_texts_index(texts_embedding, index)
-        logger.info(f"write {paper_id} texts index finish")
+            id_to_element = dict()
+            indices = []
+            index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+            for j, text in enumerate(texts):
+                idx = j + curr
+                indices.append(idx)
+                id_to_element[idx] = {"type": "text", "data": text}
+            index.add_with_ids(texts_embedding, np.array(indices))
+            curr += len(texts)
+            im.write_texts_index(paper_id, index)
+            logger.info(f"write {paper_id} texts index finish")
 
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-        images_embedding = x_updated[graph_data.images_index].cpu().detach().numpy()
-        indices = []
-        for i, image_info in enumerate(graph_data.images_info):
-            idx = i + curr
-            indices.append(idx)
-            id_to_element[str(idx)] = {"type": "image", "data": image_info.model_dump()}
-        index.add_with_ids(images_embedding, np.array(indices))
-        im.write_images_index(paper_id, index)
-        logger.info(f"write {graph_data.paper_id} images index finish")
+            index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+            indices = []
+            for j, image_info in enumerate(images_info):
+                idx = j + curr
+                indices.append(idx)
+                id_to_element[str(idx)] = {"type": "image", "data": image_info.model_dump()}
+            index.add_with_ids(images_embedding, np.array(indices))
+            im.write_images_index(paper_id, index)
+            logger.info(f"write {paper_id} images index finish")
 
-        im.write_id_to_element(paper_id, id_to_element)
-        logger.info(f"write {paper_id} id_to_element json finish")
+            im.write_id_to_element(paper_id, id_to_element)
+            logger.info(f"write {paper_id} id_to_element json finish")
         break  # TODO delete
 
 
@@ -239,9 +257,8 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
     curr_qa_count = 0
     find_true_image_count = 0
     im = IndexFileManager(write_dir, indices_dir)
-    for paper_id, paper in test_data.items():
-        with open(os.path.join(write_dir, indices_dir, f"{paper_id}.json"), "r", encoding="utf-8") as f:
-            id_to_element = json.load(f)
+    for paper_id, paper in sorted(test_data.items()):
+        id_to_element = im.read_id_to_element(paper_id)
 
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
