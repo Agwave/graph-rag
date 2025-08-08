@@ -22,7 +22,7 @@ def embedding_texts(model: CLIPModel, processor: CLIPProcessor, texts: list[str]
     return functional.normalize(text_embeddings, dim=1)
 
 
-def embedding_image(model: CLIPModel, processor: CLIPProcessor, images: list[Image.Image]) -> torch.Tensor:
+def embedding_images(model: CLIPModel, processor: CLIPProcessor, images: list[Image.Image]) -> torch.Tensor:
     inputs = processor(images=images, return_tensors="pt")
     device = model.device
     inputs = {k: v.to(device) for k, v in inputs.items()}

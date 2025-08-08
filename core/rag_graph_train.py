@@ -16,7 +16,7 @@ from torch_geometric.nn.conv import GCNConv
 from torch_geometric.loader import DataLoader
 from transformers import CLIPModel, CLIPProcessor
 
-from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
+from core.clip import init_model_and_processor, embedding_texts, embedding_images, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH, ROOT_DIR
 from core.data import read_text_file
 from core.llm import invoke_llm
@@ -330,7 +330,7 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
     for image_info in images_info:
         images.append(Image.open(image_info.path).convert("RGB"))
     texts_feature = embedding_texts(clip_model, clip_processor, texts)
-    images_feature = embedding_image(clip_model, clip_processor, images)
+    images_feature = embedding_images(clip_model, clip_processor, images)
     x = torch.concat([texts_feature, images_feature], 0)
 
     edges = []

@@ -7,7 +7,7 @@ from loguru import logger
 from openai import Client
 from PIL import Image
 
-from core.clip import init_model_and_processor, trunk_by_paragraph, embedding_texts, embedding_image
+from core.clip import init_model_and_processor, trunk_by_paragraph, embedding_texts, embedding_images
 from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
 from core.llm import invoke_llm
@@ -89,8 +89,6 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
             fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
 
-        break # TODO delete
-
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
         data = json.loads(line.strip())
@@ -147,7 +145,7 @@ def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_
                 caption=image_detail["caption"]).model_dump()
             )
 
-        image_embeddings = embedding_image(model, processor, images).cpu().detach().numpy()
+        image_embeddings = embedding_images(model, processor, images).cpu().detach().numpy()
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr
@@ -159,4 +157,3 @@ def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, write_
 
         im.write_id_to_element(paper_id, id_to_element)
         logger.info(f"write {paper_id} id_to_element json finish")
-        break # TODO delete

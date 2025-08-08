@@ -10,8 +10,9 @@ from openai import Client
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
+from transformers import CLIPModel, CLIPProcessor
 
-from core.clip import init_model_and_processor, embedding_texts, embedding_image, trunk_by_paragraph
+from core.clip import init_model_and_processor, embedding_texts, embedding_images, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
 from core.llm import invoke_llm
@@ -22,20 +23,21 @@ from core.prompt import ImageInfo
 
 def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
+    clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
     model_path = "output/best_alignment_model.pth"
     model = EmbeddingAlignmentMLP(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
         train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=64,
-                                  shuffle=True, num_workers=1, collate_fn=_custom_collate_fn)
+                                  shuffle=True, num_workers=1)
         val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=64, shuffle=True,
-                                num_workers=1, collate_fn=_custom_collate_fn)
+                                num_workers=1)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-        _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
+        _train_and_validate(model, clip_model, clip_processor, train_loader, val_loader, opt, 20, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
-    _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
-    _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
+    _run_index(model, clip_model, clip_processor, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
+    _run_search(model, clip_model, clip_processor, client, test_data_path, write_dir, file_tag, "indices")
 
 
 class EmbeddingAlignmentMLP(nn.Module):
@@ -52,19 +54,17 @@ class EmbeddingAlignmentMLP(nn.Module):
         )
         self.clip_model, self.clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
 
-    def get_texts_embedding(self, texts: list[str]):
-        texts_embeddings = embedding_texts(self.clip_model, self.clip_processor, texts)
+    def get_texts_embedding(self, texts_embeddings: torch.Tensor) -> torch.Tensor:
         aligned_texts_embedding = self.text_branch(texts_embeddings)
         return aligned_texts_embedding
 
-    def get_images_embedding(self, images: list[Image.Image]):
-        images_embedding = embedding_image(self.clip_model, self.clip_processor, images)
+    def get_images_embedding(self, images_embedding: torch.Tensor) -> torch.Tensor:
         aligned_images_embedding = self.image_branch(images_embedding)
         return aligned_images_embedding
 
     def forward(self, questions: list[str], images: list[Image.Image]):
         questions_embedding = embedding_texts(self.clip_model, self.clip_processor, questions)
-        images_embedding = embedding_image(self.clip_model, self.clip_processor, images)
+        images_embedding = embedding_images(self.clip_model, self.clip_processor, images)
         aligned_questions_embedding = self.text_branch(questions_embedding)
         aligned_images_embedding = self.image_branch(images_embedding)
         return aligned_questions_embedding, aligned_images_embedding
@@ -80,21 +80,14 @@ class ImageQuestionDataset(Dataset):
         for paper_id, paper in data.items():
             self.length += len(paper["qa"])
             for qa in paper["qa"]:
-                self.data.append((qa["question"], os.path.join(images_dir, paper_id, qa["reference"])))
+                path = os.path.join(images_dir, paper_id, qa["reference"])
+                self.data.append((qa["question"], Image.open(path).convert("RGB")))
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        question, image_path = self.data[idx]
-        image = Image.open(image_path).convert("RGB")
-        return question, image
-
-
-def _custom_collate_fn(batch):
-    questions = [item[0] for item in batch]
-    images = [item[1] for item in batch]
-    return questions, images
+        return self.data[idx]
 
 
 def _info_nce_loss(questions_embedding: torch.Tensor, images_embedding: torch.Tensor, temperature: float = 0.07):
@@ -106,17 +99,21 @@ def _info_nce_loss(questions_embedding: torch.Tensor, images_embedding: torch.Te
     return loss
 
 
-def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
-                        epochs: int, temperature: float = 0.07):
+def _train_and_validate(model: nn.Module, clip_model: CLIPModel, clip_processor: CLIPProcessor, train_loader: DataLoader,
+                        val_loader: DataLoader, optimizer: Optimizer, epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0
     for epoch in range(epochs):
 
         model.train()
         train_loss = 0
-        for batch_idx, (questions, images) in enumerate(train_loader):
+        for batch_idx, question_image_pair in enumerate(train_loader):
             optimizer.zero_grad()
-            qs_emb, is_emb = model(questions, images)
+            questions = [p[0] for p in question_image_pair]
+            images = [p[1] for p in question_image_pair]
+            questions_embedding = embedding_texts(clip_model, clip_processor, questions)
+            images_embedding = embedding_images(clip_model, clip_processor, images)
+            qs_emb, is_emb = model(questions_embedding, images_embedding)
             loss = _info_nce_loss(qs_emb, is_emb, temperature)
             loss.backward()
             optimizer.step()
@@ -128,8 +125,12 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch_idx, (questions, images) in enumerate(val_loader):
-                qs_emb, is_emb = model(questions, images)
+            for batch_idx, question_image_pair in enumerate(val_loader):
+                questions = [p[0] for p in question_image_pair]
+                images = [p[1] for p in question_image_pair]
+                questions_embedding = embedding_texts(clip_model, clip_processor, questions)
+                images_embedding = embedding_images(clip_model, clip_processor, images)
+                qs_emb, is_emb = model(questions_embedding, images_embedding)
                 loss = _info_nce_loss(qs_emb, is_emb, temperature)
                 val_loss += loss.item()
                 break  # TODO delete
@@ -152,8 +153,8 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader, val_loader: 
     logger.info("training finished")
 
 
-def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
-               indices_dir: str):
+def _run_index(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_processor: CLIPProcessor, test_data_path: str,
+               paragraphs_dir: str, images_dir: str, write_dir: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
     if not os.path.exists(os.path.join(write_dir, indices_dir)):
@@ -170,13 +171,14 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
         texts = trunk_by_paragraph(text)
         logger.info(f"paragraphs: {text[:100]}...")
 
-        text_embeddings = model.get_texts_embedding(texts).cpu().detach().numpy()
+        texts_embedding = embedding_texts(clip_model, clip_processor, texts)
+        texts_embedding = model.get_texts_embedding(texts_embedding).cpu().detach().numpy()
         indices = []
         for i, text in enumerate(texts):
             idx = i + curr
             indices.append(idx)
             id_to_element[idx] = {"type": "text", "data": text}
-        index.add_with_ids(text_embeddings, np.array(indices))
+        index.add_with_ids(texts_embedding, np.array(indices))
         curr += len(texts)
         im.write_texts_index(paper_id, index)
         logger.info(f"write {paper_id} texts index finish")
@@ -193,13 +195,14 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
                 path=os.path.join(images_dir, paper_id, image_name),
                 caption=image_detail["caption"]).model_dump())
 
-        image_embeddings = model.get_images_embedding(images).cpu().detach().numpy()
+        images_embedding = embedding_images(clip_model, clip_processor, images)
+        images_embedding = model.get_images_embedding(images_embedding).cpu().detach().numpy()
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr
             indices.append(idx)
             id_to_element[str(idx)] = {"type": "image", "data": image_info}
-        index.add_with_ids(image_embeddings, np.array(indices))
+        index.add_with_ids(images_embedding, np.array(indices))
         im.write_images_index(paper_id, index)
         logger.info(f"write {paper_id} images index finish")
 
@@ -208,8 +211,8 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
         break  # TODO delete
 
 
-def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: str, write_dir: str, file_tag: str,
-                indices_dir: str):
+def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_processor: CLIPProcessor, client: Client,
+                test_data_path: str, write_dir: str, file_tag: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -228,9 +231,10 @@ def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: st
         texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embeddings = model.get_texts_embedding(qs).cpu().detach().numpy()
-        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
-        images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
+        qs_embedding = embedding_texts(clip_model, clip_processor, qs)
+        qs_embedding = model.get_texts_embedding(qs_embedding).cpu().detach().numpy()
+        texts_distances, texts_find_indices = texts_index.search(qs_embedding, 3)
+        images_distances, images_find_indices = images_index.search(qs_embedding, 1)
 
         for i, qa in enumerate(paper["qa"]):
             curr_qa_count += 1
