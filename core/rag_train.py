@@ -1,6 +1,5 @@
 import json
 import os
-import time
 
 import faiss
 import numpy as np
@@ -27,8 +26,10 @@ from core.train import info_nce_loss
 def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
+    for param in clip_model.parameters():
+        param.requires_grad = False
     model_path = "output/best_alignment_model.pth"
-    model = EmbeddingAlignmentMLP(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
+    model = EmbeddingAlignmentMLP(512, 512).to(clip_model.device)
     if not os.path.exists(model_path):
         train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=512,
                                   shuffle=True, num_workers=8,
@@ -36,7 +37,7 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
         val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=512, shuffle=True,
                                 num_workers=8, collate_fn=lambda x: _custom_collate_fn(x, clip_processor))
         opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-        _train_and_validate(model, clip_model, train_loader, val_loader, opt, 20, 0.07)
+        _train_and_validate(model, clip_model, train_loader, val_loader, opt, 100, 0.1)
     else:
         model.load_state_dict(torch.load(model_path))
 
@@ -93,18 +94,16 @@ class ImageQuestionDataset(Dataset):
 
 
 def _custom_collate_fn(batch, clip_processor):
-    start = time.time()
     questions = [item[0] for item in batch]
     images = [item[1] for item in batch]
     questions_embedding = clip_processor(text=questions, return_tensors="pt", padding=True, truncation=True)
-    logger.debug(f"clip_processor questions, time: {time.time() - start}")
     images_embedding = clip_processor(images=images, return_tensors="pt")
-    logger.debug(f"clip_processor images, time: {time.time() - start}")
     return questions_embedding, images_embedding
 
 
 def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: DataLoader,
                         val_loader: DataLoader, optimizer: Optimizer, epochs: int, temperature: float = 0.07):
+    torch.autograd.set_detect_anomaly(True)
     best_val_loss = float("inf")
     not_improve = 0
     for epoch in range(epochs):
@@ -112,28 +111,21 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
         model.train()
         train_loss = 0
         for batch_idx, (questions_input, images_input) in enumerate(train_loader):
-            start = time.time()
-            logger.debug(f"start batch, time: {time.time() - start}")
             optimizer.zero_grad()
-            logger.debug(f"zero_grad(), time: {time.time() - start}")
             questions_input = {k: v.to(clip_model.device) for k, v in questions_input.items()}
             images_input = {k: v.to(clip_model.device) for k, v in images_input.items()}
-            logger.debug(f"v.to(model.device), time: {time.time() - start}")
-            with torch.no_grad():
-                questions_embedding = clip_model.get_text_features(**questions_input)
-                questions_embedding = functional.normalize(questions_embedding, dim=1)
-                logger.debug(f"embedding_texts, time: {time.time() - start}")
-                images_embedding = clip_model.get_image_features(**images_input)
-                images_embedding = functional.normalize(images_embedding, dim=1)
-                logger.debug(f"embedding_images, time: {time.time() - start}")
+            questions_embedding = clip_model.get_text_features(**questions_input)
+            questions_embedding = functional.normalize(questions_embedding, dim=1)
+            images_embedding = clip_model.get_image_features(**images_input)
+            images_embedding = functional.normalize(images_embedding, dim=1)
+
             qs_emb, is_emb = model(questions_embedding, images_embedding)
-            logger.debug(f"model, time: {time.time() - start}")
+            logger.debug(f"qs_emb - min: {qs_emb.min().item():.4f}, max: {qs_emb.max().item():.4f}, mean: {qs_emb.mean().item():.4f}, has nan: {torch.isnan(qs_emb).any()}")
+            logger.debug(f"is_emb - min: {is_emb.min().item():.4f}, max: {is_emb.max().item():.4f}, mean: {is_emb.mean().item():.4f}, has nan: {torch.isnan(is_emb).any()}")
             loss = info_nce_loss(qs_emb, is_emb, temperature)
-            logger.debug(f"info_nce_loss, time: {time.time() - start}")
             loss.backward()
-            logger.debug(f"loss.backward(), time: {time.time() - start}")
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-            logger.debug(f"optimizer.step(), time: {time.time() - start}")
             train_loss += loss.item()
             logger.debug(f"batch: {batch_idx + 1}, loss: {loss.item()}")
         avg_train_loss = train_loss / len(train_loader)
@@ -149,6 +141,7 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
                 questions_embedding = functional.normalize(questions_embedding, dim=1)
                 images_embedding = clip_model.get_image_features(**images_input)
                 images_embedding = functional.normalize(images_embedding, dim=1)
+
                 qs_emb, is_emb = model(questions_embedding, images_embedding)
                 loss = info_nce_loss(qs_emb, is_emb, temperature)
                 val_loss += loss.item()
