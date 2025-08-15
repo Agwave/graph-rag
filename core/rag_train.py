@@ -31,13 +31,13 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model_path = "output/best_alignment_model.pth"
     model = EmbeddingAlignmentMLP(512, 512).to(clip_model.device)
     if not os.path.exists(model_path):
-        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=512,
+        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=16,
                                   shuffle=True, num_workers=8,
                                   collate_fn=lambda x: _custom_collate_fn(x, clip_processor))
-        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=512, shuffle=True,
+        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=16, shuffle=True,
                                 num_workers=8, collate_fn=lambda x: _custom_collate_fn(x, clip_processor))
-        opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-        _train_and_validate(model, clip_model, train_loader, val_loader, opt, 100, 0.1)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        _train_and_validate(model, clip_model, train_loader, val_loader, opt, 100, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
@@ -49,26 +49,27 @@ class EmbeddingAlignmentMLP(nn.Module):
 
     def __init__(self, input_dim, output_dim):
         super(EmbeddingAlignmentMLP, self).__init__()
-        self.image_branch = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU()
-        )
-        self.text_branch = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU()
-        )
+        self.image_projection = nn.Linear(input_dim, output_dim, bias=False)
+        self.text_projection = nn.Linear(input_dim, output_dim, bias=False)
+        with torch.no_grad():
+            self.image_projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
+            self.text_projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
 
     def get_texts_embedding(self, texts_embeddings: torch.Tensor) -> torch.Tensor:
-        aligned_texts_embedding = self.text_branch(texts_embeddings)
+        aligned_texts_embedding = self.text_projection(texts_embeddings)
+        aligned_texts_embedding = functional.normalize(aligned_texts_embedding, dim=1)
         return aligned_texts_embedding
 
     def get_images_embedding(self, images_embedding: torch.Tensor) -> torch.Tensor:
-        aligned_images_embedding = self.image_branch(images_embedding)
+        aligned_images_embedding = self.image_projection(images_embedding)
+        aligned_images_embedding = functional.normalize(aligned_images_embedding, dim=1)
         return aligned_images_embedding
 
     def forward(self, questions_embedding: torch.Tensor, images_embedding: torch.Tensor):
-        aligned_questions_embedding = self.text_branch(questions_embedding)
-        aligned_images_embedding = self.image_branch(images_embedding)
+        aligned_questions_embedding = self.text_projection(questions_embedding)
+        aligned_images_embedding = self.image_projection(images_embedding)
+        aligned_questions_embedding = functional.normalize(aligned_questions_embedding, dim=1)
+        aligned_images_embedding = functional.normalize(aligned_images_embedding, dim=1)
         return aligned_questions_embedding, aligned_images_embedding
 
 
@@ -120,11 +121,9 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
             images_embedding = functional.normalize(images_embedding, dim=1)
 
             qs_emb, is_emb = model(questions_embedding, images_embedding)
-            logger.debug(f"qs_emb - min: {qs_emb.min().item():.4f}, max: {qs_emb.max().item():.4f}, mean: {qs_emb.mean().item():.4f}, has nan: {torch.isnan(qs_emb).any()}")
-            logger.debug(f"is_emb - min: {is_emb.min().item():.4f}, max: {is_emb.max().item():.4f}, mean: {is_emb.mean().item():.4f}, has nan: {torch.isnan(is_emb).any()}")
             loss = info_nce_loss(qs_emb, is_emb, temperature)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
             optimizer.step()
             train_loss += loss.item()
             logger.debug(f"batch: {batch_idx + 1}, loss: {loss.item()}")
@@ -265,39 +264,39 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
             else:
                 logger.info(f"fail to find target image | find {images_info[0].name} | target {qa['reference']}")
             logger.info(f"total num {curr_qa_count} | success find num {find_true_image_count}")
+            #
+            # texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
+            # paragraphs = "\n\n---\n\n".join(texts)
+            # try:
+            #     answer = invoke_llm(client, qa["question"], paragraphs, images_info)
+            # except Exception as e:
+            #     logger.warning(f"invoke_llm failed: {e}")
+            #     fm.write_skip_count(curr_qa_count)
+            #     continue
+            #
+            # logger.info(f"images_info {images_info}")
+            # logger.info(f"question: {qa['question']}")
+            # logger.info(f"gt_answer: {qa['answer']}")
+            # logger.info(f"pred_answer: {answer}")
+            #
+            # d = {
+            #     "id": f"{paper_id}_{i}",
+            #     "question": qa["question"],
+            #     "pred_answer": answer,
+            #     "gt_answer": qa["answer"],
+            # }
 
-            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
-            paragraphs = "\n\n---\n\n".join(texts)
-            try:
-                answer = invoke_llm(client, qa["question"], paragraphs, images_info)
-            except Exception as e:
-                logger.warning(f"invoke_llm failed: {e}")
-                fm.write_skip_count(curr_qa_count)
-                continue
-
-            logger.info(f"images_info {images_info}")
-            logger.info(f"question: {qa['question']}")
-            logger.info(f"gt_answer: {qa['answer']}")
-            logger.info(f"pred_answer: {answer}")
-
-            d = {
-                "id": f"{paper_id}_{i}",
-                "question": qa["question"],
-                "pred_answer": answer,
-                "gt_answer": qa["answer"],
-            }
-
-            fm.write_gene_line(d)
+            # fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
 
-    pred_answers, gt_answers = [], []
-    for line in fm.read_gene_file():
-        data = json.loads(line.strip())
-        pred_answers.append(data["pred_answer"])
-        gt_answers.append(data["gt_answer"])
-
-    create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
-    score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
-    score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
-    logger.info(f"score: {score}")
-    fm.write_metric(score)
+    # pred_answers, gt_answers = [], []
+    # for line in fm.read_gene_file():
+    #     data = json.loads(line.strip())
+    #     pred_answers.append(data["pred_answer"])
+    #     gt_answers.append(data["gt_answer"])
+    #
+    # create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
+    # score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
+    # score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
+    # logger.info(f"score: {score}")
+    # fm.write_metric(score)
