@@ -264,39 +264,39 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
             else:
                 logger.info(f"fail to find target image | find {images_info[0].name} | target {qa['reference']}")
             logger.info(f"total num {curr_qa_count} | success find num {find_true_image_count}")
-            #
-            # texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
-            # paragraphs = "\n\n---\n\n".join(texts)
-            # try:
-            #     answer = invoke_llm(client, qa["question"], paragraphs, images_info)
-            # except Exception as e:
-            #     logger.warning(f"invoke_llm failed: {e}")
-            #     fm.write_skip_count(curr_qa_count)
-            #     continue
-            #
-            # logger.info(f"images_info {images_info}")
-            # logger.info(f"question: {qa['question']}")
-            # logger.info(f"gt_answer: {qa['answer']}")
-            # logger.info(f"pred_answer: {answer}")
-            #
-            # d = {
-            #     "id": f"{paper_id}_{i}",
-            #     "question": qa["question"],
-            #     "pred_answer": answer,
-            #     "gt_answer": qa["answer"],
-            # }
 
-            # fm.write_gene_line(d)
+            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
+            paragraphs = "\n\n---\n\n".join(texts)
+            try:
+                answer = invoke_llm(client, qa["question"], paragraphs, images_info)
+            except Exception as e:
+                logger.warning(f"invoke_llm failed: {e}")
+                fm.write_skip_count(curr_qa_count)
+                continue
+
+            logger.info(f"images_info {images_info}")
+            logger.info(f"question: {qa['question']}")
+            logger.info(f"gt_answer: {qa['answer']}")
+            logger.info(f"pred_answer: {answer}")
+
+            d = {
+                "id": f"{paper_id}_{i}",
+                "question": qa["question"],
+                "pred_answer": answer,
+                "gt_answer": qa["answer"],
+            }
+
+            fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
 
-    # pred_answers, gt_answers = [], []
-    # for line in fm.read_gene_file():
-    #     data = json.loads(line.strip())
-    #     pred_answers.append(data["pred_answer"])
-    #     gt_answers.append(data["gt_answer"])
-    #
-    # create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
-    # score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
-    # score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
-    # logger.info(f"score: {score}")
-    # fm.write_metric(score)
+    pred_answers, gt_answers = [], []
+    for line in fm.read_gene_file():
+        data = json.loads(line.strip())
+        pred_answers.append(data["pred_answer"])
+        gt_answers.append(data["gt_answer"])
+
+    create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
+    score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
+    score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
+    logger.info(f"score: {score}")
+    fm.write_metric(score)

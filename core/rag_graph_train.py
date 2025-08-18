@@ -30,18 +30,15 @@ class EmbeddingAlignmentGNN(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int):
         super(EmbeddingAlignmentGNN, self).__init__()
-        self.linear = nn.Sequential(
-            nn.Linear(input_dim, output_dim),
-            nn.ReLU()
-        )
-        self.conv1 = GCNConv(output_dim, output_dim)
-        self.conv2 = GCNConv(output_dim, output_dim)
+        self.projection = nn.Linear(input_dim, output_dim, bias=False)
+        with torch.no_grad():
+            self.projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
+        self.conv = GCNConv(output_dim, output_dim)
 
     def forward(self, x, edge_index):
         x = self.linear(x)
-        x = self.conv1(x, edge_index)
-        x = functional.relu(x)
-        x = self.conv2(x, edge_index)
+        x = self.conv(x, edge_index)
+        x = functional.normalize(x, dim=1)
         return x
 
 
