@@ -26,6 +26,10 @@ from core.prompt import ImageInfo
 from core.train import info_nce_loss
 
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+
 class EmbeddingAlignmentGNN(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int):
@@ -34,9 +38,10 @@ class EmbeddingAlignmentGNN(nn.Module):
         with torch.no_grad():
             self.projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
         self.conv = GCNConv(output_dim, output_dim)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def forward(self, x, edge_index):
-        x = self.linear(x)
+        x = self.projection(x)
         x = self.conv(x, edge_index)
         x = functional.normalize(x, dim=1)
         return x
@@ -69,7 +74,7 @@ class GraphDataset(Dataset):
     def processed_file_names(self):
         with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        return [f"data_{idx}.pt" for idx in range(10)]
+        return [f"data_{idx}.pt" for idx in range(len(data))]
 
     def download(self):
         pass
@@ -79,8 +84,7 @@ class GraphDataset(Dataset):
             data = json.load(f)
         idx = 0
         for paper_id, paper in sorted(data.items()):
-            if idx >= 10:  # TODO delete
-                break
+            logger.debug(f"processing paper {paper_id}")
 
             target_file_path = os.path.join(self.processed_dir, f"data_{idx}.pt")
             if os.path.exists(target_file_path):
@@ -111,7 +115,7 @@ class GraphDataset(Dataset):
         return len(self.processed_file_names)
 
     def get(self, idx):
-        data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"), weights_only=False)
+        data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"), weights_only=False, map_location="cpu")
         return data
 
 
@@ -121,14 +125,14 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model = EmbeddingAlignmentGNN(512, 512).to("cuda" if torch.cuda.is_available() else "cpu")
     if not os.path.exists(model_path):
         clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
-        train_loader = DataLoader(dataset=GraphDataset(
-            train_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
-            batch_size=2, shuffle=True, num_workers=1)
-        val_loader = DataLoader(dataset=GraphDataset(
-            val_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
-            batch_size=2, shuffle=False, num_workers=1)
-        opt = torch.optim.Adam(model.parameters(), lr=1e-4)
-        _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
+        train_loader = DataLoader(
+            dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor,
+                                 os.path.join(ROOT_DIR, "train")), batch_size=2, shuffle=True, num_workers=4)
+        val_loader = DataLoader(
+            dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor,
+                                 os.path.join(ROOT_DIR, "val")), batch_size=2, shuffle=False, num_workers=4)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
@@ -145,16 +149,15 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
         model.train()
         train_loss = 0
         for batch_idx, graph_data in enumerate(train_loader):
-            graph_data: Data = graph_data
+            graph_data: Data = graph_data.to(model.device)
             optimizer.zero_grad()
             x_updated = model(graph_data.x, graph_data.edge_index)
             images_embedding = x_updated[graph_data.images_index]
-            questions_embedding = model.linear(graph_data.questions_embedding)
+            questions_embedding = model.projection(graph_data.questions_embedding)
             loss = info_nce_loss(questions_embedding, images_embedding, temperature)
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
-            break  # TODO delete
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
 
@@ -162,13 +165,12 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
         val_loss = 0
         with torch.no_grad():
             for batch_idx, graph_data in enumerate(val_loader):
-                graph_data: Data = graph_data
+                graph_data: Data = graph_data.to(model.device)
                 x_updated = model(graph_data.x, graph_data.edge_index)
                 images_embedding = x_updated[graph_data.images_index]
-                questions_embedding = model.linear(graph_data.questions_embedding)
+                questions_embedding = model.projection(graph_data.questions_embedding)
                 loss = info_nce_loss(questions_embedding, images_embedding, temperature)
                 val_loss += loss.item()
-                break  # TODO delete
         avg_val_loss = val_loss / len(val_loader)
         logger.info(f"validation Loss: {avg_val_loss:.4f}")
 
@@ -183,10 +185,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
                 logger.info("train 10 epoch no improve, early stop")
                 break
 
-        break  # TODO delete
-
     logger.info("training finished")
-
 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str,
@@ -196,26 +195,26 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir
     im = IndexFileManager(write_dir, indices_dir)
     clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
     test_loader = DataLoader(dataset=GraphDataset(
-        test_data_path, images_dir, paragraphs_dir, clip_model, clip_processor, ROOT_DIR),
-        batch_size=2, shuffle=False, num_workers=1)
+        test_data_path, images_dir, paragraphs_dir, clip_model, clip_processor, os.path.join(ROOT_DIR, "test_a")),
+        batch_size=1, shuffle=True, num_workers=0)
     for batch_idx, graph_data in enumerate(test_loader):
-        graph_data: Data = graph_data
+        graph_data: Data = graph_data.to(model.device)
         x_updated = model(graph_data.x, graph_data.edge_index)
-        texts_start_index, images_start_index = 0, 0
         logger.info(f"texts len {len(graph_data.texts)}")
         for i in range(len(graph_data.paper_id)):
-            curr = 0
             paper_id = graph_data.paper_id[i]
             texts = graph_data.texts[i]
             images_info = graph_data.images_info[i]
-            texts_embedding = x_updated[graph_data.texts_index[texts_start_index:texts_start_index + len(texts)]].cpu().detach().numpy()
-            images_embedding = x_updated[graph_data.images_index[images_start_index:images_start_index + len(images_info)]].cpu().detach().numpy()
-            texts_start_index += len(texts)
-            images_start_index += len(images_info)
+            batch_mask = (graph_data.batch == i)
+            texts_indices = graph_data.texts_index[batch_mask[graph_data.texts_index]]
+            images_indices = graph_data.images_index[batch_mask[graph_data.images_index]]
+            texts_embedding = x_updated[texts_indices].cpu().detach().numpy()
+            images_embedding = x_updated[images_indices].cpu().detach().numpy()
 
             id_to_element = dict()
             indices = []
             index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+            curr = 0
             for j, text in enumerate(texts):
                 idx = j + curr
                 indices.append(idx)
@@ -237,7 +236,6 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, paragraphs_dir
 
             im.write_id_to_element(paper_id, id_to_element)
             logger.info(f"write {paper_id} id_to_element json finish")
-        break  # TODO delete
 
 
 def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: str, write_dir: str, file_tag: str,
@@ -261,7 +259,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
         qs_embeddings = embedding_texts(clip_model, clip_processor, qs)
-        qs_embeddings = model.linear(qs_embeddings).cpu().detach().numpy()
+        qs_embeddings = model.projection(qs_embeddings).cpu().detach().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
         images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
 
@@ -306,8 +304,6 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
             fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
 
-        break  # TODO delete
-
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
         data = json.loads(line.strip())
@@ -329,26 +325,21 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
     texts_feature = embedding_texts(clip_model, clip_processor, texts)
     images_feature = embedding_images(clip_model, clip_processor, images)
     x = torch.concat([texts_feature, images_feature], 0)
+    x.to("cpu")
 
     edges = []
     for i in range(len(texts) - 1):
         edges.append([i, i + 1])
         edges.append([i + 1, i])
-    for j, image_info in enumerate(images_info):
-        logger.debug(f"image_info.name {image_info.name}")
-        caption_title = "-".join(image_info.name.split("-")[1:-1])
-        alpha, numeric = _split_alpha_numeric_loop(caption_title)
-        possible_caption_title = [alpha + " " + numeric, alpha[:3] + ". " + numeric]
-        for i, text in enumerate(texts):
-            has_caption_title = False
-            for title in possible_caption_title:
-                if title in text:
-                    has_caption_title = True
-                    break
-            if has_caption_title:
-                logger.debug(f"find caption title: {possible_caption_title}")
-                edges.append([i, j + len(texts)])
-                edges.append([j + len(texts), i])
+    index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+    indices = [i for i in range(len(texts))]
+    index.add_with_ids(texts_feature.cpu().detach().numpy(), np.array(indices))
+    texts_distances, texts_find_indices = index.search(images_feature.cpu().detach().numpy(), 5)
+    for i in range(len(texts_find_indices)):
+        for idx in texts_find_indices[i]:
+            if idx != -1:
+                edges.append([idx, len(texts) + i])
+                edges.append([len(texts) + i, idx])
     edge_index = torch.tensor(edges, dtype=torch.long).t()
 
     questions_embedding = embedding_texts(clip_model, clip_processor, [p[0] for p in question_image_name_pair])
