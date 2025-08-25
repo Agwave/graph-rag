@@ -23,6 +23,10 @@ from core.prompt import ImageInfo
 from core.train import info_nce_loss
 
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+
 def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
@@ -31,11 +35,13 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model_path = "output/best_alignment_model.pth"
     model = EmbeddingAlignmentMLP(512, 512).to(clip_model.device)
     if not os.path.exists(model_path):
-        train_loader = DataLoader(ImageQuestionDataset(train_data_path, train_val_images_dir), batch_size=16,
-                                  shuffle=True, num_workers=8,
-                                  collate_fn=lambda x: _custom_collate_fn(x, clip_processor))
-        val_loader = DataLoader(ImageQuestionDataset(val_data_path, train_val_images_dir), batch_size=16, shuffle=True,
-                                num_workers=8, collate_fn=lambda x: _custom_collate_fn(x, clip_processor))
+        dataset_dir = "output/rag_train_dataset"
+        train_loader = DataLoader(
+            ImageQuestionDataset(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train"), clip_model, clip_processor),
+            batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
+        val_loader = DataLoader(
+            ImageQuestionDataset(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val"), clip_model, clip_processor),
+            batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
         opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
         _train_and_validate(model, clip_model, train_loader, val_loader, opt, 100, 0.07)
     else:
@@ -75,31 +81,36 @@ class EmbeddingAlignmentMLP(nn.Module):
 
 class ImageQuestionDataset(Dataset):
 
-    def __init__(self, data_path: str, images_dir: str):
+    def __init__(self, data_path: str, images_dir: str, target_dir: str, clip_model: CLIPModel, clip_processor: CLIPProcessor):
+        self.target_dir = target_dir
+        if not os.path.exists(target_dir):
+            os.makedirs(target_dir)
         with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         self.length = 0
-        self.data = []
-        for paper_id, paper in data.items():
-            self.length += len(paper["qa"])
-            for qa in paper["qa"]:
-                self.data.append((qa["question"], os.path.join(images_dir, paper_id, qa["reference"])))
+        for i, (paper_id, paper) in enumerate(sorted(data.items())):
+            self.length += 1
+            if os.path.exists(os.path.join(target_dir, f"data_{i}.pt")):
+                continue
+            questions = [qa["question"] for qa in paper["qa"]]
+            images = [Image.open(os.path.join(images_dir, paper_id, qa["reference"])).convert("RGB") for qa in paper["qa"]]
+            questions_embedding = embedding_texts(clip_model, clip_processor, questions)
+            images_embedding = embedding_images(clip_model, clip_processor, images)
+            torch.save({"paper_id": paper_id, "images_embedding": images_embedding, "questions_embedding": questions_embedding}, os.path.join(target_dir, f"data_{i}.pt"))
+            logger.debug(f"saved data_{i}.pt")
+            if self.length > 10:
+                break # todo delete
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        question, image_path = self.data[idx]
-        image = Image.open(image_path).convert("RGB")
-        return question, image
+        data = torch.load(os.path.join(self.target_dir, f"data_{idx}.pt"))
+        return data
 
 
-def _custom_collate_fn(batch, clip_processor):
-    questions = [item[0] for item in batch]
-    images = [item[1] for item in batch]
-    questions_embedding = clip_processor(text=questions, return_tensors="pt", padding=True, truncation=True)
-    images_embedding = clip_processor(images=images, return_tensors="pt")
-    return questions_embedding, images_embedding
+def _custom_collate_fn(batch):
+    return batch
 
 
 def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: DataLoader,
@@ -111,39 +122,29 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
 
         model.train()
         train_loss = 0
-        for batch_idx, (questions_input, images_input) in enumerate(train_loader):
-            optimizer.zero_grad()
-            questions_input = {k: v.to(clip_model.device) for k, v in questions_input.items()}
-            images_input = {k: v.to(clip_model.device) for k, v in images_input.items()}
-            questions_embedding = clip_model.get_text_features(**questions_input)
-            questions_embedding = functional.normalize(questions_embedding, dim=1)
-            images_embedding = clip_model.get_image_features(**images_input)
-            images_embedding = functional.normalize(images_embedding, dim=1)
-
-            qs_emb, is_emb = model(questions_embedding, images_embedding)
-            loss = info_nce_loss(qs_emb, is_emb, temperature)
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
-            optimizer.step()
-            train_loss += loss.item()
-            logger.debug(f"batch: {batch_idx + 1}, loss: {loss.item()}")
+        for batch_idx, papers_input in enumerate(train_loader):
+            batch_loss = 0
+            for paper_input in papers_input:
+                optimizer.zero_grad()
+                qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
+                loss = info_nce_loss(qs_emb, is_emb, temperature)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=5.0)
+                optimizer.step()
+                batch_loss += loss.item()
+            logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f}")
+            train_loss += batch_loss
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
 
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for batch_idx, (questions_input, images_input) in enumerate(val_loader):
-                questions_input = {k: v.to(clip_model.device) for k, v in questions_input.items()}
-                images_input = {k: v.to(clip_model.device) for k, v in images_input.items()}
-                questions_embedding = clip_model.get_text_features(**questions_input)
-                questions_embedding = functional.normalize(questions_embedding, dim=1)
-                images_embedding = clip_model.get_image_features(**images_input)
-                images_embedding = functional.normalize(images_embedding, dim=1)
-
-                qs_emb, is_emb = model(questions_embedding, images_embedding)
-                loss = info_nce_loss(qs_emb, is_emb, temperature)
-                val_loss += loss.item()
+            for batch_idx, papers_input in enumerate(val_loader):
+                for paper_input in papers_input:
+                    qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
+                    loss = info_nce_loss(qs_emb, is_emb, temperature)
+                    val_loss += loss.item()
         avg_val_loss = val_loss / len(val_loader)
         logger.info(f"validation Loss: {avg_val_loss:.4f}")
 
@@ -288,6 +289,7 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
 
             fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
+        break # todo delete
 
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
