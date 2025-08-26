@@ -65,8 +65,6 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
             fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
 
-        break # TODO delete
-
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
         data = json.loads(line.strip())

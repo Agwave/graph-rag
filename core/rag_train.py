@@ -35,7 +35,7 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
     model_path = "output/best_alignment_model.pth"
     model = EmbeddingAlignmentMLP(512, 512).to(clip_model.device)
     if not os.path.exists(model_path):
-        dataset_dir = "output/rag_train_dataset"
+        dataset_dir = "output/rag_dataset"
         train_loader = DataLoader(
             ImageQuestionDataset(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train"), clip_model, clip_processor),
             batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
@@ -98,14 +98,12 @@ class ImageQuestionDataset(Dataset):
             images_embedding = embedding_images(clip_model, clip_processor, images)
             torch.save({"paper_id": paper_id, "images_embedding": images_embedding, "questions_embedding": questions_embedding}, os.path.join(target_dir, f"data_{i}.pt"))
             logger.debug(f"saved data_{i}.pt")
-            if self.length > 10:
-                break # todo delete
 
     def __len__(self):
         return self.length
 
     def __getitem__(self, idx):
-        data = torch.load(os.path.join(self.target_dir, f"data_{idx}.pt"))
+        data = torch.load(os.path.join(self.target_dir, f"data_{idx}.pt"), weights_only=False, map_location="cpu")
         return data
 
 
@@ -125,6 +123,8 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
         for batch_idx, papers_input in enumerate(train_loader):
             batch_loss = 0
             for paper_input in papers_input:
+                paper_input["questions_embedding"] = paper_input["questions_embedding"].to(clip_model.device)
+                paper_input["images_embedding"] = paper_input["images_embedding"].to(clip_model.device)
                 optimizer.zero_grad()
                 qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
                 loss = info_nce_loss(qs_emb, is_emb, temperature)
@@ -142,6 +142,8 @@ def _train_and_validate(model: nn.Module, clip_model: CLIPModel, train_loader: D
         with torch.no_grad():
             for batch_idx, papers_input in enumerate(val_loader):
                 for paper_input in papers_input:
+                    paper_input["questions_embedding"] = paper_input["questions_embedding"].to(clip_model.device)
+                    paper_input["images_embedding"] = paper_input["images_embedding"].to(clip_model.device)
                     qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
                     loss = info_nce_loss(qs_emb, is_emb, temperature)
                     val_loss += loss.item()
@@ -289,7 +291,6 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
 
             fm.write_gene_line(d)
             fm.write_skip_count(curr_qa_count)
-        break # todo delete
 
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
