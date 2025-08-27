@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Optional, Callable
 
 import faiss
@@ -64,6 +65,9 @@ class GraphDataset(Dataset):
         self.paragraphs_dir = paragraphs_dir
         self.clip_model = clip_model
         self.clip_processor = clip_processor
+        with open(self.data_path, "r", encoding="utf-8") as f:
+            self.file_names = [f"data_{idx}.pt" for idx in range(len(json.load(f)))]
+        logger.debug(f"len file_names: {len(self.file_names)}")
         super().__init__(root=root, transform=transform, pre_transform=pre_transform, pre_filter=pre_filter)
 
     @property
@@ -72,9 +76,7 @@ class GraphDataset(Dataset):
 
     @property
     def processed_file_names(self):
-        with open(self.data_path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        return [f"data_{idx}.pt" for idx in range(len(data))]
+        return self.file_names
 
     def download(self):
         pass
@@ -112,7 +114,7 @@ class GraphDataset(Dataset):
             idx += 1
 
     def len(self):
-        return len(self.processed_file_names)
+        return len(self.file_names)
 
     def get(self, idx):
         data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"), weights_only=False, map_location="cpu")
@@ -127,10 +129,10 @@ def run(client: Client, train_data_path: str, val_data_path: str, train_val_imag
         clip_model, clip_processor = init_model_and_processor(CLIP_MODEL_PATH)
         train_loader = DataLoader(
             dataset=GraphDataset(train_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor,
-                                 os.path.join(ROOT_DIR, "train")), batch_size=2, shuffle=True, num_workers=4)
+                                 os.path.join(ROOT_DIR, "train")), batch_size=16, shuffle=True, num_workers=4)
         val_loader = DataLoader(
             dataset=GraphDataset(val_data_path, train_val_images_dir, paragraphs_dir, clip_model, clip_processor,
-                                 os.path.join(ROOT_DIR, "val")), batch_size=2, shuffle=False, num_workers=4)
+                                 os.path.join(ROOT_DIR, "val")), batch_size=16, shuffle=False, num_workers=4)
         opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
         _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
     else:
@@ -149,6 +151,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
         model.train()
         train_loss = 0
         for batch_idx, graph_data in enumerate(train_loader):
+            start = time.time()
             graph_data: Data = graph_data.to(model.device)
             optimizer.zero_grad()
             x_updated = model(graph_data.x, graph_data.edge_index)
@@ -158,6 +161,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
             loss.backward()
             optimizer.step()
             train_loss += loss.item()
+            logger.debug(f"batch: {batch_idx + 1}, loss: {loss.item():.4f} {time.time() - start}")
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
 
@@ -273,7 +277,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
             logger.info(f"compute current qa {curr_qa_count} ...")
 
             images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i]]
-            if images_info[0].name == qa["reference"]:
+            if images_info[0].name == qa["reference" ]:
                 logger.info(f"success to find target image | find {images_info[0].name} | target {qa['reference']}")
                 find_true_image_count += 1
             else:
@@ -348,11 +352,3 @@ def _make_graph(clip_model: CLIPModel, clip_processor: CLIPProcessor, texts: lis
 
     return Data(x, edge_index, images_index=images_index, texts_index=texts_index,
                 questions_embedding=questions_embedding, images_info=images_info, texts=texts, paper_id=paper_id)
-
-
-def _split_alpha_numeric_loop(text):
-    if text.startswith("Figure"):
-        return text[:6], text[6:]
-    elif text.startswith("Table"):
-        return text[:5], text[5:]
-    logger.error(f"_split_alpha_numeric_loop unexpect text: {text}")
