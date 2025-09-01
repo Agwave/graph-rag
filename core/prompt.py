@@ -8,6 +8,12 @@ Please answer the question based on the paper, input images and corresponding ca
 Question: <question>. Output in the following json format: {"Answer": "Direct Answer to the Question"}. \n"""
 
 
+FIND_IMAGE_PROMPT = """You are given a question and a few input images from a scientific paper, \
+Please find the most helpful image to answer the following question. \
+Please only output the image name. Such as, 1611.04684v1-Table5-1.png \
+Question: <question>.\n"""
+
+
 class ImageInfo(BaseModel):
     type: str = Field("image/png", description="image type")
     name: str = Field("", description="name of the image")
@@ -23,6 +29,16 @@ def build_model_content(question: str, paragraphs: str, images_info: list[ImageI
         image_encoded = _encode_image_to_base64(image.path)
         res.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_encoded}"}})
         res.append({"type": "text", "text": f"Caption {i}: {image.caption}"})
+    return res
+
+
+def build_find_image_content(question: str, images_info: list[ImageInfo]) -> list[dict]:
+    res = [{"type": "text", "text": FIND_IMAGE_PROMPT.replace("<question>", question)}]
+    for i, image in enumerate(images_info):
+        res.append({"type": "text", "text": f"Image Name {image.name}:"})
+        image_encoded = _encode_image_to_base64(image.path)
+        res.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_encoded}"}})
+        # res.append({"type": "text", "text": f"Caption {i}: {image.caption}"})
     return res
 
 

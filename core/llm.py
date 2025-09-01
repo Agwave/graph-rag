@@ -4,7 +4,7 @@ from loguru import logger
 from openai import Client
 
 from core.conf import API_MODEL
-from core.prompt import build_model_content, ImageInfo
+from core.prompt import build_model_content, ImageInfo, build_find_image_content
 
 
 def invoke_llm(client: Client, question: str, paragraphs: str, images_info: list[ImageInfo]):
@@ -35,3 +35,18 @@ def extract_answer(text: str) -> str:
         return json.loads(text.strip())["Answer"]
     answer = json.loads(text[json_start+7:json_end].strip())["Answer"]
     return answer
+
+
+def invoke_llm_find_image(client: Client, question: str, images_info: list[ImageInfo]):
+    content = build_find_image_content(question, images_info)
+    completion = client.chat.completions.create(
+        model=API_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
+    )
+    response = completion.choices[0].message.content
+    return response
