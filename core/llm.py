@@ -4,7 +4,7 @@ from loguru import logger
 from openai import Client
 
 from core.conf import API_MODEL
-from core.prompt import build_model_content, ImageInfo, build_find_image_content
+from core.prompt import build_model_content, ImageInfo, build_find_image_content, build_find_image_answer_content
 
 
 def invoke_llm(client: Client, question: str, paragraphs: str, images_info: list[ImageInfo]):
@@ -50,3 +50,33 @@ def invoke_llm_find_image(client: Client, question: str, images_info: list[Image
     )
     response = completion.choices[0].message.content
     return response
+
+
+def extract_image_answer(text: str) -> (str, str):
+    json_start = text.find("```json")
+    json_end = text.rfind("```")
+    if json_start == -1 or json_end == -1:
+        logger.warning(f"_extract_json failed: {text}")
+        return json.loads(text.strip())["ImageName"], json.loads(text.strip())["Answer"]
+    image_answer = json.loads(text[json_start+7:json_end].strip())
+    return image_answer["ImageName"], image_answer["Answer"]
+
+
+def invoke_llm_find_image_answer(client: Client, question: str, paragraphs: str, images_info: list[ImageInfo]) -> (str, str):
+    content = build_find_image_answer_content(question, paragraphs, images_info)
+    completion = client.chat.completions.create(
+        model=API_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": content,
+            }
+        ]
+    )
+    response = completion.choices[0].message.content
+    try:
+        image_name, answer = extract_image_answer(response)
+    except Exception as e:
+        logger.warning(f"extract answer failed: {e}, response: {response}")
+        return response
+    return image_name, answer

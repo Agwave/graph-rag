@@ -10,7 +10,7 @@ from PIL import Image
 from core.clip import init_model_and_processor, trunk_by_paragraph, embedding_texts, embedding_images
 from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
-from core.llm import invoke_llm
+from core.llm import invoke_llm, invoke_llm_find_image_answer
 from core.metric import create_coco_eval_file, score_compute
 from core.output import FilesManager, IndexFileManager
 from core.prompt import ImageInfo
@@ -35,6 +35,7 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
     skip_qa_count = fm.read_skip_count()
 
     curr_qa_count = 0
+    llm_except_count = 0
     find_true_image_count = 0
     im = IndexFileManager(write_dir, indices_dir)
     for paper_id, paper in test_data.items():
@@ -45,8 +46,8 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
         qs_embeddings = embedding_texts(model, processor, qs).cpu().detach().numpy()
-        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
-        images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
+        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 5)
+        images_distances, images_find_indices = images_index.search(qs_embeddings, 5)
 
         for i, qa in enumerate(paper["qa"]):
             curr_qa_count += 1
@@ -57,24 +58,22 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
 
             logger.info(f"compute current qa {curr_qa_count} ...")
 
-            images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i]]
-            if images_info[0].name == qa["reference"]:
-                logger.info(f"success to find target image | find {images_info[0].name} | target {qa['reference']}")
-                find_true_image_count += 1
-            else:
-                logger.info(f"fail to find target image | find {images_info[0].name} | target {qa['reference']}")
-            logger.info(f"total num {curr_qa_count} | success find num {find_true_image_count}")
-
-            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
+            images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i] if idx >= 0]
+            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i] if idx >= 0]
             paragraphs = "\n\n---\n\n".join(texts)
             try:
-                answer = invoke_llm(client, qa["question"], paragraphs, images_info)
+                image_name, answer = invoke_llm_find_image_answer(client, qa["question"], paragraphs, images_info)
             except Exception as e:
                 logger.warning(f"invoke_llm failed: {e}")
                 fm.write_skip_count(curr_qa_count)
+                llm_except_count += 1
                 continue
 
-            logger.info(f"images_info {images_info}")
+            if image_name == qa["reference"]:
+                find_true_image_count += 1
+
+            logger.info(f"target image {qa['reference']}, predict image {image_name}")
+            logger.info(f"pred_true {find_true_image_count}, llm_except {llm_except_count}, total {curr_qa_count}, acc {find_true_image_count}/{curr_qa_count - llm_except_count}")
             logger.info(f"question: {qa['question']}")
             logger.info(f"gt_answer: {qa['answer']}")
             logger.info(f"pred_answer: {answer}")
