@@ -2,6 +2,13 @@ import json
 import os
 
 import faiss
+from pydantic import BaseModel, Field
+
+
+class Progress(BaseModel):
+    curr_total_count: int = Field(-1, description="the count of current total")
+    true_image_count: int = Field(-1, description="the count of correct image prediction")
+    except_count: int = Field(-1, description="the count of excepted prediction")
 
 
 class FilesManager:
@@ -9,7 +16,7 @@ class FilesManager:
     def __init__(self, write_dir: str, file_tag: str):
         self.write_dir = write_dir
         self.file_tag = file_tag
-        self.skip_file_path = os.path.join(write_dir, f"skip_{file_tag}.txt")
+        self.curr_file_path = os.path.join(write_dir, f"curr_{file_tag}.txt")
         self.gene_file_path = os.path.join(write_dir, f"gene_{file_tag}.txt")
         self.pred_file_path = os.path.join(write_dir, f"pred_{file_tag}.json")
         self.gnth_file_path = os.path.join(write_dir, f"gnth_{file_tag}.json")
@@ -17,16 +24,16 @@ class FilesManager:
         if not os.path.exists(self.write_dir):
             os.makedirs(self.write_dir)
 
-    def read_skip_count(self) -> int:
-        skip_qa_count = 0
-        if os.path.exists(self.skip_file_path):
-            with open(self.skip_file_path, "r", encoding="utf-8") as f:
-                skip_qa_count = int(f.read())
-        return skip_qa_count
+    def read_curr_progress(self) -> Progress:
+        if not os.path.exists(self.curr_file_path):
+            return Progress(curr_total_count=0, true_image_count=0, except_count=0)
+        with open(self.curr_file_path, "r", encoding="utf-8") as f:
+            curr_progress = json.load(f)
+        return Progress.model_validate(curr_progress)
 
-    def write_skip_count(self, skip_qa_count: str):
-        with open(self.skip_file_path, "w", encoding="utf-8") as f:
-            f.write(str(skip_qa_count))
+    def write_curr_progress(self, progress: Progress):
+        with open(self.curr_file_path, "w", encoding="utf-8") as f:
+            json.dump(progress.model_dump(), f)
 
     def read_gene_file(self) -> iter:
         with open(self.gene_file_path, "r", encoding="utf-8") as f:

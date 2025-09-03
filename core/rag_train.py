@@ -16,7 +16,7 @@ from transformers import CLIPModel, CLIPProcessor
 from core.clip import init_model_and_processor, embedding_texts, embedding_images, trunk_by_paragraph
 from core.conf import CLIP_MODEL_PATH
 from core.data import read_text_file
-from core.llm import invoke_llm
+from core.llm import invoke_llm_find_image_answer
 from core.metric import create_coco_eval_file, score_compute
 from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
@@ -232,10 +232,7 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
     logger.info(f"current tag {file_tag}")
 
     fm = FilesManager(write_dir, file_tag)
-    skip_qa_count = fm.read_skip_count()
-
-    curr_qa_count = 0
-    find_true_image_count = 0
+    progress = fm.read_curr_progress()
     im = IndexFileManager(write_dir, indices_dir)
     model.eval()
     for paper_id, paper in test_data.items():
@@ -249,35 +246,34 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
         with torch.no_grad():
             qs_embedding = model.get_texts_embedding(qs_embedding).cpu().detach().numpy()
         texts_distances, texts_find_indices = texts_index.search(qs_embedding, 3)
-        images_distances, images_find_indices = images_index.search(qs_embedding, 1)
+        images_distances, images_find_indices = images_index.search(qs_embedding, 3)
 
         for i, qa in enumerate(paper["qa"]):
-            curr_qa_count += 1
-            if skip_qa_count > 0:
-                skip_qa_count -= 1
-                logger.info(f"skip qa {curr_qa_count}")
+            if i < progress.curr_total_count:
+                logger.info(f"skip qa {i+1}")
                 continue
 
-            logger.info(f"compute current qa {curr_qa_count} ...")
+            progress.curr_total_count += 1
+            logger.info(f"compute current qa {progress.curr_total_count} ...")
 
-            images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i]]
-            if images_info[0].name == qa["reference"]:
-                logger.info(f"success to find target image | find {images_info[0].name} | target {qa['reference']}")
-                find_true_image_count += 1
-            else:
-                logger.info(f"fail to find target image | find {images_info[0].name} | target {qa['reference']}")
-            logger.info(f"total num {curr_qa_count} | success find num {find_true_image_count}")
-
-            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
+            images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i] if idx >= 0]
+            texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i] if idx >= 0]
             paragraphs = "\n\n---\n\n".join(texts)
             try:
-                answer = invoke_llm(client, qa["question"], paragraphs, images_info)
+                image_name, answer = invoke_llm_find_image_answer(client, qa["question"], paragraphs, images_info)
             except Exception as e:
                 logger.warning(f"invoke_llm failed: {e}")
-                fm.write_skip_count(curr_qa_count)
+                progress.except_count += 1
+                fm.write_curr_progress(progress)
                 continue
 
-            logger.info(f"images_info {images_info}")
+            if image_name == qa["reference"]:
+                progress.true_image_count += 1
+
+            logger.info(f"target image {qa['reference']}, predict image {image_name}")
+            logger.info(f"pred_true {progress.find_true_image_count}, llm_except {progress.except_count}, "
+                        f"total {progress.curr_total_count}, "
+                        f"acc {progress.find_true_image_count/(progress.curr_qa_count - progress.except_count)}")
             logger.info(f"question: {qa['question']}")
             logger.info(f"gt_answer: {qa['answer']}")
             logger.info(f"pred_answer: {answer}")
@@ -290,7 +286,7 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
             }
 
             fm.write_gene_line(d)
-            fm.write_skip_count(curr_qa_count)
+            fm.write_curr_progress(progress)
 
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
@@ -300,6 +296,6 @@ def _run_search(model: EmbeddingAlignmentMLP, clip_model: CLIPModel, clip_proces
 
     create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
     score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
-    score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
+    score["RetAcc"] = round(progress.find_true_image_count / progress.curr_qa_count, 4)
     logger.info(f"score: {score}")
     fm.write_metric(score)

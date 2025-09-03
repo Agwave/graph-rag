@@ -16,11 +16,8 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
         test_data = json.load(f)
 
     logger.info(f"current tag {file_tag}")
-
     fm = FilesManager(os.path.join(write_dir, file_tag), file_tag)
-    skip_qa_count = fm.read_skip_count()
-
-    curr_qa_count = 0
+    progress = fm.read_curr_progress()
     for paper_id, paper in test_data.items():
 
         images_info = []
@@ -34,19 +31,19 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
 
         paragraphs = read_text_file(os.path.join(paragraphs_dir, f"{paper_id}.txt"))
         for i, qa in enumerate(paper["qa"]):
-            curr_qa_count += 1
-            if skip_qa_count > 0:
-                skip_qa_count -= 1
-                logger.info(f"skip qa {curr_qa_count}")
+            if i < progress.curr_total_count:
+                logger.info(f"skip qa {i+1}")
                 continue
 
-            logger.info(f"compute current qa {curr_qa_count} ...")
+            progress.curr_total_count += 1
+            logger.info(f"compute current qa {progress.curr_total_count} ...")
 
             try:
                 answer = invoke_llm(client, qa["question"], paragraphs, images_info)
             except Exception as e:
                 logger.warning(f"qwen_run failed: {e}")
-                fm.write_skip_count(curr_qa_count)
+                progress.except_count += 1
+                fm.write_curr_progress(progress)
                 continue
 
             logger.info(f"paragraphs len: {len(paragraphs)}")
@@ -63,7 +60,7 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
             }
 
             fm.write_gene_line(d)
-            fm.write_skip_count(curr_qa_count)
+            fm.write_curr_progress(progress)
 
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():

@@ -251,10 +251,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
     logger.info(f"current tag {file_tag}")
 
     fm = FilesManager(write_dir, file_tag)
-    skip_qa_count = fm.read_skip_count()
-
-    curr_qa_count = 0
-    find_true_image_count = 0
+    progress = fm.read_curr_progress()
     im = IndexFileManager(write_dir, indices_dir)
     for paper_id, paper in sorted(test_data.items()):
         id_to_element = im.read_id_to_element(paper_id)
@@ -264,33 +261,26 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
         qs = [qa["question"] for qa in paper["qa"]]
         qs_embeddings = embedding_texts(clip_model, clip_processor, qs)
         qs_embeddings = model.projection(qs_embeddings).cpu().detach().numpy()
-        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
-        images_distances, images_find_indices = images_index.search(qs_embeddings, 1)
+        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 5)
+        images_distances, images_find_indices = images_index.search(qs_embeddings, 5)
 
         for i, qa in enumerate(paper["qa"]):
-            curr_qa_count += 1
-            if skip_qa_count > 0:
-                skip_qa_count -= 1
-                logger.info(f"skip qa {curr_qa_count}")
+            if i < progress.curr_total_count:
+                logger.info(f"skip qa {i+1}")
                 continue
 
-            logger.info(f"compute current qa {curr_qa_count} ...")
+            progress.curr_total_count += 1
+            logger.info(f"compute current qa {progress.curr_total_count} ...")
 
             images_info = [ImageInfo(**id_to_element[str(idx)]["data"]) for idx in images_find_indices[i]]
-            if images_info[0].name == qa["reference" ]:
-                logger.info(f"success to find target image | find {images_info[0].name} | target {qa['reference']}")
-                find_true_image_count += 1
-            else:
-                logger.info(f"fail to find target image | find {images_info[0].name} | target {qa['reference']}")
-            logger.info(f"total num {curr_qa_count} | success find num {find_true_image_count}")
-
             texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i]]
             paragraphs = "\n\n---\n\n".join(texts)
             try:
                 answer = invoke_llm(client, qa["question"], paragraphs, images_info)
             except Exception as e:
                 logger.warning(f"invoke_llm failed: {e}")
-                fm.write_skip_count(curr_qa_count)
+                progress.except_count += 1
+                fm.write_curr_progress(progress)
                 continue
 
             logger.info(f"images_info {images_info}")
@@ -306,7 +296,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
             }
 
             fm.write_gene_line(d)
-            fm.write_skip_count(curr_qa_count)
+            fm.write_curr_progress(progress)
 
     pred_answers, gt_answers = [], []
     for line in fm.read_gene_file():
@@ -316,7 +306,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
 
     create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
     score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
-    score["RetAcc"] = round(find_true_image_count / curr_qa_count, 4)
+    score["RetAcc"] = round(progress.find_true_image_count / progress.curr_qa_count, 4)
     logger.info(f"score: {score}")
     fm.write_metric(score)
 
