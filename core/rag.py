@@ -34,6 +34,7 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
     fm = FilesManager(write_dir, file_tag)
     progress = fm.read_curr_progress()
     im = IndexFileManager(write_dir, indices_dir)
+    curr = 0
     for paper_id, paper in test_data.items():
         with open(os.path.join(write_dir, indices_dir, f"{paper_id}.json"), "r", encoding="utf-8") as f:
             id_to_element = json.load(f)
@@ -42,12 +43,13 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
         qs_embeddings = embedding_texts(model, processor, qs).cpu().detach().numpy()
-        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 5)
-        images_distances, images_find_indices = images_index.search(qs_embeddings, 5)
+        texts_distances, texts_find_indices = texts_index.search(qs_embeddings, 3)
+        images_distances, images_find_indices = images_index.search(qs_embeddings, 3)
 
         for i, qa in enumerate(paper["qa"]):
-            if i < progress.curr_total_count:
-                logger.info(f"skip qa {i+1}")
+            curr += 1
+            if curr < progress.curr_total_count:
+                logger.info(f"skip qa {curr}")
                 continue
 
             progress.curr_total_count += 1
@@ -65,12 +67,12 @@ def _run_search(client: Client, test_data_path: str, write_dir: str, file_tag: s
                 continue
 
             if image_name == qa["reference"]:
-                progress.find_true_image_count += 1
+                progress.true_image_count += 1
 
             logger.info(f"target image {qa['reference']}, predict image {image_name}")
-            logger.info(f"pred_true {progress.find_true_image_count}, llm_except {progress.except_count}, "
+            logger.info(f"pred_true {progress.true_image_count}, llm_except {progress.except_count}, "
                         f"total {progress.curr_total_count}, "
-                        f"acc {progress.find_true_image_count/(progress.curr_qa_count - progress.except_count)}")
+                        f"acc {progress.true_image_count/(progress.curr_total_count - progress.except_count)}")
             logger.info(f"question: {qa['question']}")
             logger.info(f"gt_answer: {qa['answer']}")
             logger.info(f"pred_answer: {answer}")

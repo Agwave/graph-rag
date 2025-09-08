@@ -18,6 +18,7 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
     logger.info(f"current tag {file_tag}")
     fm = FilesManager(os.path.join(write_dir, file_tag), file_tag)
     progress = fm.read_curr_progress()
+    curr = 0
     for paper_id, paper in test_data.items():
 
         images_info = []
@@ -31,8 +32,9 @@ def run(client: Client, test_data_path: str, paragraphs_dir: str, images_dir: st
 
         paragraphs = read_text_file(os.path.join(paragraphs_dir, f"{paper_id}.txt"))
         for i, qa in enumerate(paper["qa"]):
-            if i < progress.curr_total_count:
-                logger.info(f"skip qa {i+1}")
+            curr += 1
+            if curr < progress.curr_total_count:
+                logger.info(f"skip qa {curr}")
                 continue
 
             progress.curr_total_count += 1

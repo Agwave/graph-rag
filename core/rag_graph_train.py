@@ -253,6 +253,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
     fm = FilesManager(write_dir, file_tag)
     progress = fm.read_curr_progress()
     im = IndexFileManager(write_dir, indices_dir)
+    curr = 0
     for paper_id, paper in sorted(test_data.items()):
         id_to_element = im.read_id_to_element(paper_id)
 
@@ -265,8 +266,9 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
         images_distances, images_find_indices = images_index.search(qs_embeddings, 5)
 
         for i, qa in enumerate(paper["qa"]):
-            if i < progress.curr_total_count:
-                logger.info(f"skip qa {i+1}")
+            curr += 1
+            if curr < progress.curr_total_count:
+                logger.info(f"skip qa {curr}")
                 continue
 
             progress.curr_total_count += 1
@@ -306,7 +308,7 @@ def _run_search(model: EmbeddingAlignmentGNN, client: Client, test_data_path: st
 
     create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
     score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
-    score["RetAcc"] = round(progress.find_true_image_count / progress.curr_qa_count, 4)
+    score["RetAcc"] = round(progress.true_image_count / progress.curr_qa_count, 4)
     logger.info(f"score: {score}")
     fm.write_metric(score)
 
