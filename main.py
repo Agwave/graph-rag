@@ -4,6 +4,7 @@ from datetime import datetime
 from openai import OpenAI
 
 from core.conf import show_env, SPIQA_DIR, WRITE_DIR
+from core.cot import run as cot_run
 from core.full import run as full_run
 from core.rag import run as rag_run
 from core.rag_train import run as rag_train_run
@@ -23,11 +24,12 @@ def run():
     now = datetime.now()
     curr_time = now.strftime("%Y%m%d%H%M")
     # full_run(client, test_data_path, paragraphs_dir, test_images_dir, os.path.join(WRITE_DIR, f"full_{curr_time}"), f"full_{curr_time}")
+    # cot_run(client, test_data_path, test_images_dir)
     # rag_run(client, test_data_path, paragraphs_dir, test_images_dir, os.path.join(WRITE_DIR, f"rag_{curr_time}"), f"rag_{curr_time}")
-    # rag_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
-    #               paragraphs_dir, os.path.join(WRITE_DIR, f"rag_train_{curr_time}"), f"rag_train_{curr_time}")
-    rag_graph_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
-                        paragraphs_dir, WRITE_DIR, curr_time)
+    rag_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
+                  paragraphs_dir, os.path.join(WRITE_DIR, f"rag_train_{curr_time}"), f"rag_train_{curr_time}")
+    # rag_graph_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
+    #                     paragraphs_dir, os.path.join(WRITE_DIR, f"graph_rag_train_{curr_time}"), curr_time)
 
 
 if __name__ == '__main__':
