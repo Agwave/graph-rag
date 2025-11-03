@@ -35,7 +35,7 @@ def build_model_content(question: str, paragraphs: str, images_info: list[ImageI
            {"type": "text", "text": f"Paragraphs from the paper: {paragraphs}"}]
     for i, image in enumerate(images_info):
         res.append({"type": "text", "text": f"Image {i}:"})
-        image_encoded = _encode_image_to_base64(image.path)
+        image_encoded = encode_image_to_base64(image.path)
         res.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_encoded}"}})
         # res.append({"type": "text", "text": f"Caption {i}: {image.caption}"})
     return res
@@ -45,7 +45,7 @@ def build_find_image_content(question: str, images_info: list[ImageInfo]) -> lis
     res = [{"type": "text", "text": FIND_IMAGE_PROMPT.replace("<question>", question)}]
     for i, image in enumerate(images_info):
         res.append({"type": "text", "text": f"Image Name {image.name}:"})
-        image_encoded = _encode_image_to_base64(image.path)
+        image_encoded = encode_image_to_base64(image.path)
         res.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_encoded}"}})
         # res.append({"type": "text", "text": f"Caption {i}: {image.caption}"})
     return res
@@ -56,11 +56,11 @@ def build_find_image_answer_content(question: str, paragraphs: str, images_info:
            {"type": "text", "text": f"Paragraphs from the paper: {paragraphs}"}]
     for i, image in enumerate(images_info):
         res.append({"type": "text", "text": f"Image Name {image.name}:"})
-        image_encoded = _encode_image_to_base64(image.path)
+        image_encoded = encode_image_to_base64(image.path)
         res.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_encoded}"}})
     return res
 
 
-def _encode_image_to_base64(path: str) -> str:
+def encode_image_to_base64(path: str) -> str:
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")

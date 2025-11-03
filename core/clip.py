@@ -31,11 +31,6 @@ def embedding_images(model: CLIPModel, processor: CLIPProcessor, images: list[Im
     return functional.normalize(image_embeddings, dim=1)
 
 
-def trunk_by_paragraph(text: str) -> list[str]:
-    texts = text.split("\n\n")
-    return texts
-
-
 def _id_to_text(texts: list[str], curr: int) -> dict[int, str]:
     res = dict()
     for i, text in enumerate(texts):
