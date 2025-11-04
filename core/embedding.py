@@ -34,7 +34,16 @@ async def invoke_llm_embedding(semaphore, model_name, api_key, model_input):
             api_key=api_key,
             input=model_input,
         )
-        if resp["status_code"] != 200:
+        fail_count = 0
+        while resp["status_code"] != 200 and fail_count < 5:
             logger.warning(f"resp status_code not 200: {resp}")
+            await asyncio.sleep(2 ** fail_count)
+            fail_count += 1
+            resp = await dashscope.AioMultiModalEmbedding.call(
+                model=model_name,
+                api_key=api_key,
+                input=model_input,
+            )
+        if fail_count >= 5:
             raise
         return resp["output"]["embeddings"][0]["embedding"]
