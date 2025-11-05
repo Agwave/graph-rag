@@ -16,11 +16,11 @@ async def embedding_texts(model_name, api_key, texts):
     return np.array(res)
 
 
-async def embedding_images(model_name, api_key, images_info):
+async def embedding_images(model_name, api_key, images_path):
     semaphore = asyncio.Semaphore(3)
     tasks = []
-    for image_info in images_info:
-        image_encoded = encode_image_to_base64(image_info.path)
+    for path in images_path:
+        image_encoded = encode_image_to_base64(path)
         tasks.append(invoke_llm_embedding(semaphore, model_name, api_key,
                                           [{"image": f"data:image/png;base64,{image_encoded}"}]))
     res = await asyncio.gather(*tasks, return_exceptions=True)

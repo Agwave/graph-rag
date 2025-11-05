@@ -143,7 +143,7 @@ async def _run_index(test_data_path: str, paragraphs_dir: str, images_dir: str, 
                 caption=image_detail["caption"])
             )
 
-        image_embeddings = await embedding_images(EMB_MODEL_NAME, LLM_API_KEY, images_info)
+        image_embeddings = await embedding_images(EMB_MODEL_NAME, LLM_API_KEY, [image_info.path for image_info in images_info])
 
         indices = []
         for i, image_info in enumerate(images_info):
