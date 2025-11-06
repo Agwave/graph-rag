@@ -27,16 +27,14 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
-def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
+async def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     model_path = "output/best_alignment_model.pth"
     # model = EmbeddingAlignmentMLP(EMB_DIM, EMB_DIM).to("cuda:0")
     if not os.path.exists(model_path):
         dataset_dir = "output/rag_dataset"
-        logger.debug("111")
-        ImageQuestionDataset(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train"))
-        ImageQuestionDataset(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val"))
-        logger.debug("222")
+        await ImageQuestionDataset.create(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train"))
+        await ImageQuestionDataset.create(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val"))
 
     #     train_loader = DataLoader(
     #         ImageQuestionDataset(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train")),
@@ -83,26 +81,36 @@ class EmbeddingAlignmentMLP(nn.Module):
 
 class ImageQuestionDataset(Dataset):
 
-    def __init__(self, data_path: str, images_dir: str, target_dir: str):
-        logger.debug("333")
+    def __init__(self, target_dir: str, data):
         self.target_dir = target_dir
+        self.length = len(data)
+
+    @classmethod
+    async def create(cls, data_path: str, images_dir: str, target_dir: str):
         if not os.path.exists(target_dir):
             os.makedirs(target_dir)
         with open(data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
-        logger.debug("444")
-        self.length = 0
-        for i, (paper_id, paper) in enumerate(sorted(data.items())):
-            self.length += 1
+
+        sorted_data = sorted(data.items())
+
+        for i, (paper_id, paper) in enumerate(sorted_data):
             if os.path.exists(os.path.join(target_dir, f"data_{i}.pt")):
                 continue
             questions = [qa["question"] for qa in paper["qa"]]
             images_path = [os.path.join(images_dir, paper_id, qa["reference"]) for qa in paper["qa"]]
-            questions_embedding = torch.from_numpy(embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, questions))
-            images_embedding = torch.from_numpy(embedding_images(EMB_MODEL_NAME, LLM_API_KEY, images_path))
+
+            questions_embedding = torch.from_numpy(
+                await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, questions)
+            )
+            images_embedding = torch.from_numpy(
+                await embedding_images(EMB_MODEL_NAME, LLM_API_KEY, images_path)
+            )
+
             torch.save({"paper_id": paper_id, "images_embedding": images_embedding, "questions_embedding": questions_embedding}, os.path.join(target_dir, f"data_{i}.pt"))
             logger.debug(f"saved data_{i}.pt")
-        logger.debug("555")
+
+        return cls(target_dir, sorted_data)
 
     def __len__(self):
         return self.length
@@ -169,7 +177,7 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader,
     logger.info("training finished")
 
 
-def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, indices_dir: str):
+async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
     if not os.path.exists(os.path.join(write_dir, indices_dir)):
@@ -188,7 +196,7 @@ def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir
         texts = trunk_by_paragraph(text)
         logger.info(f"paragraphs: {text[:100]}...")
 
-        texts_embedding = torch.from_numpy(embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, texts))
+        texts_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, texts))
         with torch.no_grad():
             texts_embedding = model.get_texts_embedding(texts_embedding).cpu().detach().numpy()
         indices = []

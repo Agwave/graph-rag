@@ -2,7 +2,7 @@ import dashscope
 import asyncio
 
 import numpy as np
-from torch.fx.passes.pass_manager import logger
+from loguru import logger
 
 from core.prompt import encode_image_to_base64
 
