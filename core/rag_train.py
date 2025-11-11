@@ -26,37 +26,38 @@ from core.train import info_nce_loss
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
+COUNT = 50
+
 
 async def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
         test_data_path: str, test_images_dir: str, paragraphs_dir: str, write_dir: str, file_tag: str):
     model_path = "output/best_alignment_model.pth"
-    # model = EmbeddingAlignmentMLP(EMB_DIM, EMB_DIM).to("cuda:0")
+    model = EmbeddingAlignmentMLP(EMB_DIM, EMB_DIM)
+    model = model.to(model.device)
     if not os.path.exists(model_path):
         dataset_dir = "output/rag_dataset"
-        await ImageQuestionDataset.create(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train"))
-        await ImageQuestionDataset.create(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val"))
+        train_loader = DataLoader(
+            await ImageQuestionDataset.create(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train")),
+            batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
+        val_loader = DataLoader(
+            await ImageQuestionDataset.create(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val")),
+            batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        _train_and_validate(model, train_loader, val_loader, opt, 2, 0.07)
+    else:
+        model.load_state_dict(torch.load(model_path))
 
-    #     train_loader = DataLoader(
-    #         ImageQuestionDataset(train_data_path, train_val_images_dir, os.path.join(dataset_dir, "train")),
-    #         batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
-    #     val_loader = DataLoader(
-    #         ImageQuestionDataset(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val")),
-    #         batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
-    #     opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-    #     _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
-    # else:
-    #     model.load_state_dict(torch.load(model_path))
-    #
-    # _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
-    # _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
+    await _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
+    await _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
 
 
 class EmbeddingAlignmentMLP(nn.Module):
 
     def __init__(self, input_dim, output_dim):
         super(EmbeddingAlignmentMLP, self).__init__()
-        self.image_projection = nn.Linear(input_dim, output_dim, bias=False)
-        self.text_projection = nn.Linear(input_dim, output_dim, bias=False)
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.image_projection = nn.Linear(input_dim, output_dim, bias=False, dtype=torch.float32)
+        self.text_projection = nn.Linear(input_dim, output_dim, bias=False, dtype=torch.float32)
         with torch.no_grad():
             self.image_projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
             self.text_projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
@@ -83,7 +84,7 @@ class ImageQuestionDataset(Dataset):
 
     def __init__(self, target_dir: str, data):
         self.target_dir = target_dir
-        self.length = len(data)
+        self.length = COUNT
 
     @classmethod
     async def create(cls, data_path: str, images_dir: str, target_dir: str):
@@ -94,7 +95,7 @@ class ImageQuestionDataset(Dataset):
 
         sorted_data = sorted(data.items())
 
-        for i, (paper_id, paper) in enumerate(sorted_data):
+        for i, (paper_id, paper) in enumerate(sorted_data[:50]):
             if os.path.exists(os.path.join(target_dir, f"data_{i}.pt")):
                 continue
             questions = [qa["question"] for qa in paper["qa"]]
@@ -136,8 +137,8 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader,
         for batch_idx, papers_input in enumerate(train_loader):
             batch_loss = 0
             for paper_input in papers_input:
-                paper_input["questions_embedding"] = paper_input["questions_embedding"].to(model.device)
-                paper_input["images_embedding"] = paper_input["images_embedding"].to(model.device)
+                paper_input["questions_embedding"] = paper_input["questions_embedding"].to(model.device).float()
+                paper_input["images_embedding"] = paper_input["images_embedding"].to(model.device).float()
                 optimizer.zero_grad()
                 qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
                 loss = info_nce_loss(qs_emb, is_emb, temperature)
@@ -155,8 +156,8 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader,
         with torch.no_grad():
             for batch_idx, papers_input in enumerate(val_loader):
                 for paper_input in papers_input:
-                    paper_input["questions_embedding"] = paper_input["questions_embedding"].to(model.device)
-                    paper_input["images_embedding"] = paper_input["images_embedding"].to(model.device)
+                    paper_input["questions_embedding"] = paper_input["questions_embedding"].to(model.device).float()
+                    paper_input["images_embedding"] = paper_input["images_embedding"].to(model.device).float()
                     qs_emb, is_emb = model(paper_input["questions_embedding"], paper_input["images_embedding"])
                     loss = info_nce_loss(qs_emb, is_emb, temperature)
                     val_loss += loss.item()
@@ -190,26 +191,26 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
         id_to_element = dict()
         curr = 0
 
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
-        paragraphs_file_path = os.path.join(paragraphs_dir, f"{paper_id}.txt")
-        text = read_text_file(paragraphs_file_path)
-        texts = trunk_by_paragraph(text)
-        logger.info(f"paragraphs: {text[:100]}...")
+        # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
+        # paragraphs_file_path = os.path.join(paragraphs_dir, f"{paper_id}.txt")
+        # text = read_text_file(paragraphs_file_path)
+        # texts = trunk_by_paragraph(text)
+        # logger.info(f"paragraphs: {text[:100]}...")
+        #
+        # texts_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, texts)).to(model.device).float()
+        # with torch.no_grad():
+        #     texts_embedding = model.get_texts_embedding(texts_embedding).cpu().detach().numpy()
+        # indices = []
+        # for i, text in enumerate(texts):
+        #     idx = i + curr
+        #     indices.append(idx)
+        #     id_to_element[idx] = {"type": "text", "data": text}
+        # index.add_with_ids(texts_embedding, np.array(indices))
+        # curr += len(texts)
+        # im.write_texts_index(paper_id, index)
+        # logger.info(f"write {paper_id} texts index finish")
 
-        texts_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, texts))
-        with torch.no_grad():
-            texts_embedding = model.get_texts_embedding(texts_embedding).cpu().detach().numpy()
-        indices = []
-        for i, text in enumerate(texts):
-            idx = i + curr
-            indices.append(idx)
-            id_to_element[idx] = {"type": "text", "data": text}
-        index.add_with_ids(texts_embedding, np.array(indices))
-        curr += len(texts)
-        im.write_texts_index(paper_id, index)
-        logger.info(f"write {paper_id} texts index finish")
-
-        index = faiss.IndexIDMap(faiss.IndexFlatL2(512))
+        index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
         images_info = []
         for image_name, image_detail in paper["all_figures"].items():
             images_info.append(ImageInfo(
@@ -218,7 +219,7 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
                 path=os.path.join(images_dir, paper_id, image_name),
                 caption=image_detail["caption"]))
 
-        images_embedding = torch.from_numpy(embedding_images(EMB_MODEL_NAME, LLM_API_KEY, [image_info.path for image_info in images_info]))
+        images_embedding = torch.from_numpy(await embedding_images(EMB_MODEL_NAME, LLM_API_KEY, [image_info.path for image_info in images_info])).to(model.device).float()
         with torch.no_grad():
             images_embedding = model.get_images_embedding(images_embedding).cpu().detach().numpy()
         indices = []
@@ -234,11 +235,11 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
         logger.info(f"write {paper_id} id_to_element json finish")
 
         count += 1
-        if count >= 50:
+        if count >= COUNT:
             break
 
 
-def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: str, write_dir: str, file_tag: str, indices_dir: str):
+async def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: str, write_dir: str, file_tag: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -255,13 +256,13 @@ def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: st
         with open(os.path.join(write_dir, indices_dir, f"{paper_id}.json"), "r", encoding="utf-8") as f:
             id_to_element = json.load(f)
 
-        texts_index = im.read_texts_index(paper_id)
+        # texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
         qs = [qa["question"] for qa in paper["qa"]]
-        qs_embedding = torch.from_numpy(embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, qs))
+        qs_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, qs)).to(model.device).float()
         with torch.no_grad():
             qs_embedding = model.get_texts_embedding(qs_embedding).cpu().detach().numpy()
-        texts_distances, texts_find_indices = texts_index.search(qs_embedding, 3)
+        # texts_distances, texts_find_indices = texts_index.search(qs_embedding, 3)
         images_distances, images_find_indices = images_index.search(qs_embedding, 3)
 
         for i, qa in enumerate(paper["qa"]):
@@ -308,7 +309,7 @@ def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: st
             # fm.write_curr_progress(progress)
 
         count += 1
-        if count >= 50:
+        if count >= COUNT:
             break
 
     # pred_answers, gt_answers = [], []
