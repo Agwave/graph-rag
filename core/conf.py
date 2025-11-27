@@ -3,7 +3,7 @@ import os
 from loguru import logger
 
 
-SPIQA_DIR = os.getenv("SPIQA_DIR", "./datasets/spiqa")
+SPIQA_DIR = os.getenv("SPIQA_DIR", "/home/chenyinbo/.cache/huggingface/hub/datasets--google--spiqa/snapshots/1774b71511f029b82089a069d75328f25fbf0705")
 WRITE_DIR = os.getenv("WRITE_DIR", "./output")
 BERT_MODEL_DIR = os.getenv("BERT_MODEL_DIR", "./models/bert-base-uncased")
 API_MODEL = os.getenv("API_MODEL", "qwen-vl-max-2025-08-13")

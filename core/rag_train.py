@@ -8,16 +8,11 @@ import torch.nn as nn
 import torch.nn.functional as functional
 from loguru import logger
 from openai import Client
-from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torch.optim import Optimizer
 
 from core.embedding import embedding_texts, embedding_images
-from core.preprocess import trunk_by_paragraph
 from core.conf import EMB_MODEL_NAME, LLM_API_KEY, EMB_DIM
-from core.data import read_text_file
-from core.llm import invoke_llm_find_image_answer
-from core.metric import create_coco_eval_file, score_compute
 from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
 from core.train import info_nce_loss
@@ -26,7 +21,7 @@ from core.train import info_nce_loss
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-COUNT = 50
+COUNT = 30000000
 
 
 async def run(client: Client, train_data_path: str, val_data_path: str, train_val_images_dir: str,
@@ -43,12 +38,12 @@ async def run(client: Client, train_data_path: str, val_data_path: str, train_va
             await ImageQuestionDataset.create(val_data_path, train_val_images_dir, os.path.join(dataset_dir, "val")),
             batch_size=2, shuffle=True, num_workers=4, collate_fn=lambda x: _custom_collate_fn(x))
         opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-        _train_and_validate(model, train_loader, val_loader, opt, 2, 0.07)
+        _train_and_validate(model, train_loader, val_loader, opt, 20, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
-    await _run_index(model, test_data_path, paragraphs_dir, test_images_dir, write_dir, "indices")
-    await _run_search(model, client, test_data_path, write_dir, file_tag, "indices")
+    await _run_index(model, test_data_path, test_images_dir, write_dir, "indices")
+    await _run_search(model, test_data_path, write_dir, file_tag, "indices")
 
 
 class EmbeddingAlignmentMLP(nn.Module):
@@ -82,9 +77,9 @@ class EmbeddingAlignmentMLP(nn.Module):
 
 class ImageQuestionDataset(Dataset):
 
-    def __init__(self, target_dir: str, data):
+    def __init__(self, target_dir: str, length):
         self.target_dir = target_dir
-        self.length = COUNT
+        self.length = length
 
     @classmethod
     async def create(cls, data_path: str, images_dir: str, target_dir: str):
@@ -95,7 +90,7 @@ class ImageQuestionDataset(Dataset):
 
         sorted_data = sorted(data.items())
 
-        for i, (paper_id, paper) in enumerate(sorted_data[:50]):
+        for i, (paper_id, paper) in enumerate(sorted_data[:COUNT]):
             if os.path.exists(os.path.join(target_dir, f"data_{i}.pt")):
                 continue
             questions = [qa["question"] for qa in paper["qa"]]
@@ -111,7 +106,7 @@ class ImageQuestionDataset(Dataset):
             torch.save({"paper_id": paper_id, "images_embedding": images_embedding, "questions_embedding": questions_embedding}, os.path.join(target_dir, f"data_{i}.pt"))
             logger.debug(f"saved data_{i}.pt")
 
-        return cls(target_dir, sorted_data)
+        return cls(target_dir, len(sorted_data[:COUNT]))
 
     def __len__(self):
         return self.length
@@ -178,7 +173,7 @@ def _train_and_validate(model: nn.Module, train_loader: DataLoader,
     logger.info("training finished")
 
 
-async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragraphs_dir: str, images_dir: str, write_dir: str, indices_dir: str):
+async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, images_dir: str, write_dir: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
     if not os.path.exists(os.path.join(write_dir, indices_dir)):
@@ -187,28 +182,9 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
     im = IndexFileManager(write_dir, indices_dir)
     model.eval()
     count = 0
-    for paper_id, paper in sorted(test_data.items()):
+    for i, (paper_id, paper) in enumerate(sorted(test_data.items())):
         id_to_element = dict()
         curr = 0
-
-        # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
-        # paragraphs_file_path = os.path.join(paragraphs_dir, f"{paper_id}.txt")
-        # text = read_text_file(paragraphs_file_path)
-        # texts = trunk_by_paragraph(text)
-        # logger.info(f"paragraphs: {text[:100]}...")
-        #
-        # texts_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, texts)).to(model.device).float()
-        # with torch.no_grad():
-        #     texts_embedding = model.get_texts_embedding(texts_embedding).cpu().detach().numpy()
-        # indices = []
-        # for i, text in enumerate(texts):
-        #     idx = i + curr
-        #     indices.append(idx)
-        #     id_to_element[idx] = {"type": "text", "data": text}
-        # index.add_with_ids(texts_embedding, np.array(indices))
-        # curr += len(texts)
-        # im.write_texts_index(paper_id, index)
-        # logger.info(f"write {paper_id} texts index finish")
 
         index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
         images_info = []
@@ -219,9 +195,11 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
                 path=os.path.join(images_dir, paper_id, image_name),
                 caption=image_detail["caption"]))
 
-        images_embedding = torch.from_numpy(await embedding_images(EMB_MODEL_NAME, LLM_API_KEY, [image_info.path for image_info in images_info])).to(model.device).float()
+        data = torch.load(os.path.join("output/rag_dataset/test-A-all_figures", f"data_{i}.pt"), weights_only=False, map_location="cpu")
+        image_embeddings = data["all_figures_embedding"].to(model.device).float()
         with torch.no_grad():
-            images_embedding = model.get_images_embedding(images_embedding).cpu().detach().numpy()
+            images_embedding = model.get_images_embedding(image_embeddings).cpu().detach().numpy()
+
         indices = []
         for i, image_info in enumerate(images_info):
             idx = i + curr
@@ -239,7 +217,7 @@ async def _run_index(model: EmbeddingAlignmentMLP, test_data_path: str, paragrap
             break
 
 
-async def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_path: str, write_dir: str, file_tag: str, indices_dir: str):
+async def _run_search(model: EmbeddingAlignmentMLP, test_data_path: str, write_dir: str, file_tag: str, indices_dir: str):
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -252,17 +230,15 @@ async def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_pa
     curr = 0
     count = 0
     score = dict()
-    for paper_id, paper in sorted(test_data.items()):
+    for i, (paper_id, paper) in enumerate(sorted(test_data.items())):
         with open(os.path.join(write_dir, indices_dir, f"{paper_id}.json"), "r", encoding="utf-8") as f:
             id_to_element = json.load(f)
 
-        # texts_index = im.read_texts_index(paper_id)
         images_index = im.read_images_index(paper_id)
-        qs = [qa["question"] for qa in paper["qa"]]
-        qs_embedding = torch.from_numpy(await embedding_texts(EMB_MODEL_NAME, LLM_API_KEY, qs)).to(model.device).float()
+        data = torch.load(os.path.join("output/rag_dataset/test-A", f"data_{i}.pt"), weights_only=False, map_location="cpu")
+        qs_embeddings = data["questions_embedding"].to(model.device).float()
         with torch.no_grad():
-            qs_embedding = model.get_texts_embedding(qs_embedding).cpu().detach().numpy()
-        # texts_distances, texts_find_indices = texts_index.search(qs_embedding, 3)
+            qs_embedding = model.get_texts_embedding(qs_embeddings).cpu().detach().numpy()
         images_distances, images_find_indices = images_index.search(qs_embedding, 3)
 
         for i, qa in enumerate(paper["qa"]):
@@ -280,46 +256,10 @@ async def _run_search(model: EmbeddingAlignmentMLP, client: Client, test_data_pa
             logger.info(f"target image {qa['reference']}, predict image {images_info[0].name}")
             logger.info(f"acc {progress.true_image_count / progress.curr_total_count}")
 
-            # texts = [id_to_element[str(idx)]["data"] for idx in texts_find_indices[i] if idx >= 0]
-            # paragraphs = "\n\n---\n\n".join(texts)
-            # try:
-            #     image_name, answer = invoke_llm_find_image_answer(client, qa["question"], paragraphs, images_info)
-            # except Exception as e:
-            #     logger.warning(f"invoke_llm failed: {e}")
-            #     progress.except_count += 1
-            #     fm.write_curr_progress(progress)
-            #     continue
-            #
-            # logger.info(f"target image {qa['reference']}, predict image {image_name}")
-            # logger.info(f"pred_true {progress.true_image_count}, llm_except {progress.except_count}, "
-            #             f"total {progress.curr_total_count}, "
-            #             f"acc {progress.true_image_count/(progress.curr_total_count - progress.except_count)}")
-            # logger.info(f"question: {qa['question']}")
-            # logger.info(f"gt_answer: {qa['answer']}")
-            # logger.info(f"pred_answer: {answer}")
-            #
-            # d = {
-            #     "id": f"{paper_id}_{i}",
-            #     "question": qa["question"],
-            #     "pred_answer": answer,
-            #     "gt_answer": qa["answer"],
-            # }
-            #
-            # fm.write_gene_line(d)
-            # fm.write_curr_progress(progress)
-
         count += 1
         if count >= COUNT:
             break
 
-    # pred_answers, gt_answers = [], []
-    # for line in fm.read_gene_file():
-    #     data = json.loads(line.strip())
-    #     pred_answers.append(data["pred_answer"])
-    #     gt_answers.append(data["gt_answer"])
-    #
-    # create_coco_eval_file(fm.pred_file_path, fm.gnth_file_path, pred_answers, gt_answers)
-    # score = score_compute(fm.pred_file_path, fm.gnth_file_path, metrics=["METEOR", "ROUGE_L", "CIDEr", "BERTScore"])
     score["RetAcc"] = round(progress.true_image_count / progress.curr_total_count, 4)
     logger.info(f"score: {score}")
     fm.write_metric(score)

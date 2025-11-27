@@ -17,7 +17,7 @@ from torch_geometric.nn.conv import GCNConv
 from torch_geometric.loader import DataLoader
 from transformers import CLIPModel, CLIPProcessor
 
-from core.clip import init_model_and_processor, embedding_texts, embedding_images, trunk_by_paragraph
+from core.clip import init_model_and_processor, embedding_texts, embedding_images
 from core.conf import CLIP_MODEL_PATH, ROOT_DIR
 from core.data import read_text_file
 from core.llm import invoke_llm
