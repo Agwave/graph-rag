@@ -230,12 +230,12 @@ async def _run_search(model: EmbeddingAlignmentMLP, test_data_path: str, write_d
     curr = 0
     count = 0
     score = dict()
-    for i, (paper_id, paper) in enumerate(sorted(test_data.items())):
+    for j, (paper_id, paper) in enumerate(sorted(test_data.items())):
         with open(os.path.join(write_dir, indices_dir, f"{paper_id}.json"), "r", encoding="utf-8") as f:
             id_to_element = json.load(f)
 
         images_index = im.read_images_index(paper_id)
-        data = torch.load(os.path.join("output/rag_dataset/test-A", f"data_{i}.pt"), weights_only=False, map_location="cpu")
+        data = torch.load(os.path.join("output/rag_dataset/test-A", f"data_{j}.pt"), weights_only=False, map_location="cpu")
         qs_embeddings = data["questions_embedding"].to(model.device).float()
         with torch.no_grad():
             qs_embedding = model.get_texts_embedding(qs_embeddings).cpu().detach().numpy()

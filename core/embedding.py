@@ -13,9 +13,9 @@ async def embedding_texts(model_name, api_key, texts):
     tasks = []
     for text in texts:
         tasks.append(invoke_llm_embedding(semaphore, model_name, api_key, [{"text": text}]))
-    res = await asyncio.gather(*tasks, return_exceptions=True)
-    logger.debug(f"embedding_texts res type {[type(r) for r in res]}")
-    logger.debug(f"embedding_texts res len {[len(r) for r in res]}")
+    res = await asyncio.gather(*tasks)
+    # logger.debug(f"embedding_texts res type {[type(r) for r in res]}")
+    # logger.debug(f"embedding_texts res len {[len(r) for r in res]}")
     return np.array(res, dtype=np.float32)
 
 
@@ -27,15 +27,15 @@ async def embedding_images(model_name, api_key, images_path):
         tasks.append(invoke_llm_embedding(semaphore, model_name, api_key,
                                           [{"image": f"data:image/png;base64,{image_encoded}"}]))
     res = await asyncio.gather(*tasks, return_exceptions=True)
-    logger.debug(f"embedding_images res type {[type(r) for r in res]}")
-    logger.debug(f"embedding_images res len {[len(r) for r in res]}")
+    # logger.debug(f"embedding_images res type {[type(r) for r in res]}")
+    # logger.debug(f"embedding_images res len {[len(r) for r in res]}")
     return np.array(res, dtype=np.float32)
 
 
 async def invoke_llm_embedding(semaphore, model_name, api_key, model_input, timeout=30):
     fail_count = 0
 
-    while fail_count < 5:
+    while fail_count <= 1:
         try:
             # 使用 asyncio.wait_for 设置超时
             async with semaphore:

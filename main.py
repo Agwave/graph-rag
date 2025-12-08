@@ -27,13 +27,15 @@ def run():
     # full_run(client, test_data_path, paragraphs_dir, test_images_dir, os.path.join(WRITE_DIR, f"full_{curr_time}"), f"full_{curr_time}")
     # cot_run(client, test_data_path, test_images_dir)
     # rag_run(test_data_path, test_images_dir, os.path.join(WRITE_DIR, f"rag_{curr_time}"), f"rag_{curr_time}")
-    asyncio.run(rag_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
-                  paragraphs_dir, os.path.join(WRITE_DIR, f"rag_train_{curr_time}"), f"rag_train_{curr_time}"))
-    # rag_graph_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
-    #                     paragraphs_dir, os.path.join(WRITE_DIR, f"graph_rag_train_{curr_time}"), curr_time)
+    # asyncio.run(rag_train_run(client, train_data_path, val_data_path, train_val_images_dir, test_data_path, test_images_dir,
+    #               paragraphs_dir, os.path.join(WRITE_DIR, f"rag_train_{curr_time}"), f"rag_train_{curr_time}"))
+    rag_graph_train_run(train_data_path, val_data_path, test_data_path,
+                        os.path.join(WRITE_DIR, f"graph_rag_train_{curr_time}"), curr_time)
 
 
 if __name__ == '__main__':
     run()
-    # from core.emb.emb import run
-    # run()
+    # from core.emb.emb import run as emb_run
+    # emb_run()
+    # from core.emb.store import run_graph_dataset_store
+    # run_graph_dataset_store()
