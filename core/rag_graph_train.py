@@ -1,27 +1,58 @@
 import json
 import os
 import time
+from datetime import datetime
 from typing import Optional, Callable
 
 import faiss
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
+from loguru import logger
+from torch.optim.optimizer import Optimizer
 from torch_geometric.data import Data, Dataset, Batch
-from torch_geometric.nn.conv import GCNConv
+from torch_geometric.nn.conv import GCNConv, SAGEConv
 from torch_geometric.loader import DataLoader
 
-from core.conf import ROOT_DIR, EMB_DIM
+from core.conf import ROOT_DIR, EMB_DIM, SPIQA_DIR, WRITE_DIR
 from core.output import IndexFileManager, FilesManager
 from core.prompt import ImageInfo
 from core.train import info_nce_loss
 
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.nn.functional as functional
-from loguru import logger
-from torch.optim.optimizer import Optimizer
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+
+
+def run():
+    train_data_path = os.path.join(SPIQA_DIR, "train_val/SPIQA_train.json")
+    val_data_path = os.path.join(SPIQA_DIR, "train_val/SPIQA_val.json")
+    test_data_path = os.path.join(SPIQA_DIR, "test-A/SPIQA_testA.json")
+    file_tag = datetime.now().strftime("%Y%m%d%H%M")
+    write_dir = os.path.join(WRITE_DIR, f"graph_rag_train_{file_tag}")
+    dataset_dir = "/home/chenyinbo/dataset/graph-rag-output/graph_dataset"
+    model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth"
+
+    model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to("cuda" if torch.cuda.is_available() else "cpu")
+    if not os.path.exists(model_path):
+        train_loader = DataLoader(
+            dataset=GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
+                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train")),
+            batch_size=128, shuffle=True, num_workers=4)
+        val_loader = DataLoader(
+            dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images"),
+                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val")),
+            batch_size=128, shuffle=False, num_workers=4)
+        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
+    else:
+        model.load_state_dict(torch.load(model_path))
+
+    _run_index(model, test_data_path, dataset_dir, write_dir, "indices")
+    _run_search(model, test_data_path, dataset_dir, write_dir, file_tag, "indices")
+
 
 
 class EmbeddingAlignmentGNN(nn.Module):
@@ -29,15 +60,20 @@ class EmbeddingAlignmentGNN(nn.Module):
     def __init__(self, input_dim: int, output_dim: int):
         super(EmbeddingAlignmentGNN, self).__init__()
         self.projection = nn.Linear(input_dim, output_dim, bias=False)
-        with torch.no_grad():
-            self.projection.weight.data = torch.eye(output_dim, input_dim) * 0.1
-        self.conv = GCNConv(output_dim, output_dim)
+        nn.init.xavier_uniform_(self.projection.weight)
+        self.conv1 = SAGEConv(output_dim, output_dim)
+        self.conv2 = SAGEConv(output_dim, output_dim)
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def forward(self, x, edge_index):
         x = self.projection(x)
-        x = self.conv(x, edge_index)
-        x = functional.normalize(x, dim=1)
+        x = self.conv1(x, edge_index)
+        x = self.act(x)
+        x = self.dropout(x)
+        x = self.conv2(x, edge_index)
+        x = F.normalize(x, dim=1)
         return x
 
 
@@ -77,11 +113,12 @@ class GraphDataset(Dataset):
         with open(self.data_path, "r", encoding="utf-8") as f:
             data = json.load(f)
         for i, (paper_id, paper) in enumerate(sorted(data.items())):
-            logger.debug(f"processing paper {i} {paper_id}")
 
             target_file_path = os.path.join(self.processed_dir, f"data_{i}.pt")
             if os.path.exists(target_file_path):
                 continue
+            logger.debug(f"processing paper {i} {paper_id}")
+
             if not os.path.exists(os.path.join(self.texts_dir, f"data_{i}.pt")):
                 logger.warning(f"data_{i}.pt not found")
                 continue
@@ -118,32 +155,11 @@ class GraphDataset(Dataset):
         return data
 
 
-def run(train_data_path: str, val_data_path: str, test_data_path: str, write_dir: str, file_tag: str):
-    model_path = "output/best_gnn_model.pth"
-    dataset_dir = "output/graph_dataset"
-    model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to("cuda" if torch.cuda.is_available() else "cpu")
-    if not os.path.exists(model_path):
-        train_loader = DataLoader(
-            dataset=GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
-                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train")),
-            batch_size=128, shuffle=True, num_workers=4)
-        val_loader = DataLoader(
-            dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images"),
-                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val")),
-            batch_size=128, shuffle=False, num_workers=4)
-        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
-        _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
-    else:
-        model.load_state_dict(torch.load(model_path))
-
-    _run_index(model, test_data_path, dataset_dir, write_dir, "indices")
-    _run_search(model, test_data_path, dataset_dir, write_dir, file_tag, "indices")
-
-
 def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0
+    losses = []
     for epoch in range(epochs):
 
         model.train()
@@ -191,19 +207,27 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
                 val_loss += batch_loss.item()
                 logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f} {time.time() - start}")
         avg_val_loss = val_loss / len(val_loader)
+        losses.append(avg_train_loss)
         logger.info(f"validation Loss: {avg_val_loss:.4f}")
 
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save(model.state_dict(), "output/best_gnn_model.pth")
+            torch.save(model.state_dict(), "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth")
             logger.info(f"saved best model with Validation Loss: {best_val_loss:.4f}")
             not_improve = 0
         else:
             not_improve += 1
-            if not_improve >= 10:
+            if not_improve >= 5:
                 logger.info("train 10 epoch no improve, early stop")
                 break
 
+    logger.info(f"losses: {losses}")
+    plt.plot(losses, label="baseline")
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title("Loss curve")
+    plt.legend()
+    plt.show()
     logger.info("training finished")
 
 
@@ -327,3 +351,7 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
     return Data(x, edge_index, paper_id=paper_id, all_images_index=all_images_index, texts_index=texts_index,
                 reference_images_index=reference_images_index, questions_embedding=questions_embedding,
                 texts=texts, all_images_info=all_images_info)
+
+
+if __name__ == '__main__':
+    run()
