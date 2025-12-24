@@ -2,9 +2,11 @@ import os
 import random
 import json
 import time
+import re
 from dataclasses import dataclass
 from typing import Optional, Callable, Literal
 from datetime import datetime
+from collections import Counter
 
 import faiss
 import numpy as np
@@ -16,7 +18,7 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data, Dataset
-from torch_geometric.nn import SAGEConv
+from torch_geometric.nn import SAGEConv, GINConv, GCNConv
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -45,14 +47,16 @@ def run():
 
     dataset_dir = "/home/chenyinbo/dataset/graph-rag-output/graph_dataset"
     model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth"
-    model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to("cuda" if torch.cuda.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to(device)
+    model_q = QuestionEncoder(EMB_DIM).to(device)
     if not os.path.exists(model_path):
         train_loader = DataLoader(
             dataset=build_dataset_subset(GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
                                  os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train")), cfg),
             batch_size=cfg.batch_size, shuffle=True, num_workers=4)
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=1e-5)
-        train(model, train_loader, opt, get_num_epochs(cfg), 0.07)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3, amsgrad=True)
+        train(model, model_q, train_loader, opt, get_num_epochs(cfg), 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
 
@@ -74,7 +78,7 @@ class ExpConfig:
 
 
     batch_size: int = 128
-    lr: float = 1e-4
+    lr: float = 1e-3
     seed: int = 42
 
 
@@ -227,12 +231,34 @@ class GraphDataset(Dataset):
 
 def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_embedding, reference_images_name, questions_embedding,
                 all_images_info) -> Data:
+
     x = torch.concat([texts_embedding, all_images_embedding], 0)
 
-    edges = []
-    for i in range(len(texts) - 1):
-        edges.append([i, i + 1])
-        edges.append([i + 1, i])
+    edge_set = set()
+    # for i in range(len(texts) - 1):
+    #     edge_set.add((i, i + 1))
+
+    for i, text in enumerate(texts):
+        counter = count_figure_table(text)
+        for j, image_name in enumerate(all_images_name):
+            try:
+                _, figure_table_and_num, _ = image_name.split("-")
+            except Exception:
+                logger.warning(f"image name {image_name} not found")
+                continue
+            if figure_table_and_num.startswith("Figure"):
+                is_figure = True
+                num = figure_table_and_num[6:]
+            else:
+                is_figure = False
+                num = figure_table_and_num[5:]
+            if is_figure:
+                if (("Figure", num) in counter) or ("Fig.", num) in counter:
+                    edge_set.add((i, len(texts) + j))
+            else:
+                if ("Table", num) in counter:
+                    edge_set.add((i, len(texts) + j))
+
     index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
     indices = [i for i in range(len(texts))]
     index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
@@ -240,8 +266,13 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
     for i in range(len(texts_find_indices)):
         for idx in texts_find_indices[i]:
             if idx != -1:
-                edges.append([idx, len(texts) + i])
-                edges.append([len(texts) + i, idx])
+                edge_set.add((idx, len(texts) + i))
+
+    edges = []
+    for edge in edge_set:
+        edges.append([edge[0], edge[1]])
+        edges.append([edge[1], edge[0]])
+
     edge_index = torch.tensor(edges, dtype=torch.long).t()
 
     all_images_index = torch.tensor([len(texts) + i for i in range(len(all_images_name))], dtype=torch.long)
@@ -254,7 +285,19 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
                 texts=texts, all_images_info=all_images_info)
 
 
-def train(model: EmbeddingAlignmentGNN, train_loader: DataLoader, optimizer: Optimizer,
+def count_figure_table(text: str) -> dict:
+    pattern = (
+        r'\b'
+        r'(Fig(?:ure)?s?\.?|Tables?)'  # group 1: Figure / Fig. / Table
+        r'(?:\s*([1-9]\d*))?'  # group 2: 编号（可选，只捕获数字）
+        r'(?:[a-z]|\([a-z]\))?'  # a / (a)，但不捕获
+        r'\b'
+    )
+    matches = re.findall(pattern, text)
+    return dict(Counter(matches))
+
+
+def train(model: EmbeddingAlignmentGNN, model_q: QuestionEncoder, train_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0

@@ -1,8 +1,11 @@
 import json
 import os
 import time
+import re
+import random
 from datetime import datetime
 from typing import Optional, Callable
+from collections import Counter
 
 import faiss
 import numpy as np
@@ -27,6 +30,7 @@ os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
 
 def run():
+    set_seed(42)
     train_data_path = os.path.join(SPIQA_DIR, "train_val/SPIQA_train.json")
     val_data_path = os.path.join(SPIQA_DIR, "train_val/SPIQA_val.json")
     test_data_path = os.path.join(SPIQA_DIR, "test-A/SPIQA_testA.json")
@@ -45,7 +49,7 @@ def run():
             dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images"),
                                  os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val")),
             batch_size=128, shuffle=False, num_workers=4)
-        opt = torch.optim.Adam(model.parameters(), lr=1e-4, weight_decay=1e-5)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3, amsgrad=True)
         _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
@@ -155,11 +159,40 @@ class GraphDataset(Dataset):
         return data
 
 
+def validate_one_epoch(model, loader, temperature):
+    model.eval()
+    total_loss = 0
+    with torch.no_grad():
+        for graph_data in loader:
+            batch_loss = 0
+            graph_data = graph_data.to(model.device)
+            x_updated = model(graph_data.x, graph_data.edge_index)
+            node_nums = 0
+            for i in range(len(graph_data.paper_id)):
+                gi = graph_data[i]
+                images_indices = gi.reference_images_index + node_nums
+                images_embedding = x_updated[images_indices]
+                questions_embedding = model.projection(gi.questions_embedding)
+                loss = info_nce_loss(questions_embedding, images_embedding, temperature)
+                batch_loss += loss
+                node_nums += graph_data[i].x.size(0)
+            total_loss += batch_loss.item()
+    return total_loss / len(loader)
+
+
 def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
                         epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0
-    losses = []
+    train_losses, val_losses = [], []
+
+    logger.info("Calculating initial loss (Epoch 0)...")
+    # 初始状态下，我们假设 train_loss 和 val_loss 差不多，或者只算一次 val 作为基准
+    initial_loss = validate_one_epoch(model, val_loader, temperature)
+    train_losses.append(initial_loss)  # 用验证集初始值占位
+    val_losses.append(initial_loss)
+    logger.info(f"Epoch 0/{epochs}, Initial Validation Loss: {initial_loss:.4f}")
+
     for epoch in range(epochs):
 
         model.train()
@@ -186,6 +219,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
 
         avg_train_loss = train_loss / len(train_loader)
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
+        train_losses.append(avg_train_loss)
 
         model.eval()
         val_loss = 0
@@ -207,7 +241,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
                 val_loss += batch_loss.item()
                 logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f} {time.time() - start}")
         avg_val_loss = val_loss / len(val_loader)
-        losses.append(avg_train_loss)
+        val_losses.append(avg_val_loss)
         logger.info(f"validation Loss: {avg_val_loss:.4f}")
 
         if avg_val_loss < best_val_loss:
@@ -217,18 +251,37 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
             not_improve = 0
         else:
             not_improve += 1
-            if not_improve >= 5:
-                logger.info("train 10 epoch no improve, early stop")
+            if not_improve >= 2:
+                logger.info(f"train {not_improve} epoch no improve, early stop")
                 break
 
-    logger.info(f"losses: {losses}")
-    plt.plot(losses, label="baseline")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("Loss curve")
-    plt.legend()
+    # 打印最终的 Loss 列表，方便以后手动绘图
+    logger.info(f"Final Train Losses: {train_losses}")
+    logger.info(f"Final Val Losses: {val_losses}")
+
+    # 绘制更专业的图表
+    plt.style.use('seaborn-v0_8-muted')  # 使用一个漂亮的主题
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    x = range(1, len(train_losses) + 1)
+    ax.plot(x, train_losses, 'b-o', label='Train Loss', markersize=4)
+    ax.plot(x, val_losses, 'r-s', label='Val Loss', markersize=4)
+
+    # 找到并标注最小验证损耗点
+    min_val_idx = val_losses.index(min(val_losses))
+    ax.annotate(f'Best: {val_losses[min_val_idx]:.4f}',
+                xy=(x[min_val_idx], val_losses[min_val_idx]),
+                xytext=(x[min_val_idx], val_losses[min_val_idx] + 0.5),
+                arrowprops=dict(facecolor='black', shrink=0.05))
+
+    ax.set_xlabel('Epoch')
+    ax.set_ylabel('Loss')
+    ax.set_title('Learning Curves (Embedding Alignment)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
     plt.show()
-    logger.info("training finished")
 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: str, write_dir: str, indices_dir: str):
@@ -326,12 +379,34 @@ def _run_search(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: 
 
 def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_embedding, reference_images_name, questions_embedding,
                 all_images_info) -> Data:
+
     x = torch.concat([texts_embedding, all_images_embedding], 0)
 
-    edges = []
-    for i in range(len(texts) - 1):
-        edges.append([i, i + 1])
-        edges.append([i + 1, i])
+    edge_set = set()
+    # for i in range(len(texts) - 1):
+    #     edge_set.add((i, i + 1))
+
+    for i, text in enumerate(texts):
+        counter = count_figure_table(text)
+        for j, image_name in enumerate(all_images_name):
+            try:
+                _, figure_table_and_num, _ = image_name.split("-")
+            except Exception:
+                logger.warning(f"image name {image_name} not found")
+                continue
+            if figure_table_and_num.startswith("Figure"):
+                is_figure = True
+                num = figure_table_and_num[6:]
+            else:
+                is_figure = False
+                num = figure_table_and_num[5:]
+            if is_figure:
+                if (("Figure", num) in counter) or ("Fig.", num) in counter:
+                    edge_set.add((i, len(texts) + j))
+            else:
+                if ("Table", num) in counter:
+                    edge_set.add((i, len(texts) + j))
+
     index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
     indices = [i for i in range(len(texts))]
     index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
@@ -339,8 +414,13 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
     for i in range(len(texts_find_indices)):
         for idx in texts_find_indices[i]:
             if idx != -1:
-                edges.append([idx, len(texts) + i])
-                edges.append([len(texts) + i, idx])
+                edge_set.add((idx, len(texts) + i))
+
+    edges = []
+    for edge in edge_set:
+        edges.append([edge[0], edge[1]])
+        edges.append([edge[1], edge[0]])
+
     edge_index = torch.tensor(edges, dtype=torch.long).t()
 
     all_images_index = torch.tensor([len(texts) + i for i in range(len(all_images_name))], dtype=torch.long)
@@ -351,6 +431,25 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
     return Data(x, edge_index, paper_id=paper_id, all_images_index=all_images_index, texts_index=texts_index,
                 reference_images_index=reference_images_index, questions_embedding=questions_embedding,
                 texts=texts, all_images_info=all_images_info)
+
+
+def count_figure_table(text: str) -> dict:
+    pattern = (
+        r'\b'
+        r'(Fig(?:ure)?s?\.?|Tables?)'  # group 1: Figure / Fig. / Table
+        r'(?:\s*([1-9]\d*))?'  # group 2: 编号（可选，只捕获数字）
+        r'(?:[a-z]|\([a-z]\))?'  # a / (a)，但不捕获
+        r'\b'
+    )
+    matches = re.findall(pattern, text)
+    return dict(Counter(matches))
+
+
+def set_seed(seed: int):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
 
 if __name__ == '__main__':
