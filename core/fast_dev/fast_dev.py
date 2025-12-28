@@ -18,7 +18,7 @@ from torch.optim.optimizer import Optimizer
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
 from torch_geometric.data import Data, Dataset
-from torch_geometric.nn import SAGEConv, GINConv, GCNConv
+from torch_geometric.nn import SAGEConv, GINConv, GCNConv, LayerNorm
 from loguru import logger
 from pydantic import BaseModel, Field
 
@@ -46,7 +46,7 @@ def run():
     curr_time = datetime.now().strftime("%Y%m%d%H%M")
 
     dataset_dir = "/home/chenyinbo/dataset/graph-rag-output/graph_dataset"
-    model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth"
+    model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model_fast.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to(device)
     model_q = QuestionEncoder(EMB_DIM).to(device)
@@ -112,6 +112,37 @@ def get_num_epochs(cfg: ExpConfig):
         return cfg.full_epochs
 
 
+class ModernGNNBlock(nn.Module):
+    """
+    现代 GNN 层设计范式：
+    Norm -> Activation -> GNN Conv -> Dropout -> Residual
+    (类似于 Transformer 的 Pre-Norm 结构，训练更稳定)
+    """
+
+    def __init__(self, channels, dropout=0.1):
+        super().__init__()
+        self.norm = nn.LayerNorm(channels)
+        # 这里可以替换为任何卷积层，如 GATv2Conv, TransformerConv 等
+        self.conv = SAGEConv(channels, channels)
+        self.dropout = nn.Dropout(dropout)
+        self.act = nn.ReLU()
+
+    def forward(self, x, edge_index):
+        # 1. 残差连接分支
+        identity = x
+
+        # 2. 归一化与激活 (Pre-norm 范式)
+        x = self.norm(x)
+        x = self.act(x)
+
+        # 3. 核心消息传递 (Forward 只更新特征)
+        x = self.conv(x, edge_index)
+
+        # 4. Dropout 与 残差合并
+        x = self.dropout(x)
+        return x + identity
+
+
 class EmbeddingAlignmentGNN(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int):
@@ -120,16 +151,26 @@ class EmbeddingAlignmentGNN(nn.Module):
         nn.init.xavier_uniform_(self.projection.weight)
         self.conv1 = SAGEConv(output_dim, output_dim)
         self.conv2 = SAGEConv(output_dim, output_dim)
-        self.act = nn.ReLU()
-        self.dropout = nn.Dropout(0.1)
+        self.conv3 = SAGEConv(output_dim, output_dim)
+        self.act1 = nn.ReLU()
+        self.act2 = nn.ReLU()
+        self.dropout1 = nn.Dropout(0.1)
+        self.dropout2 = nn.Dropout(0.1)
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def forward(self, x, edge_index):
+        identity = x
         x = self.projection(x)
         x = self.conv1(x, edge_index)
-        x = self.act(x)
-        x = self.dropout(x)
+        x = self.act1(x)
+        x = self.dropout1(x)
+        x = x + identity
+        identity = x
         x = self.conv2(x, edge_index)
+        x = self.act2(x)
+        x = self.dropout2(x)
+        x = x + identity
+        x = self.conv3(x, edge_index)
         x = F.normalize(x, dim=1)
         return x
 

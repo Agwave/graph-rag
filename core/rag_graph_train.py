@@ -58,7 +58,6 @@ def run():
     _run_search(model, test_data_path, dataset_dir, write_dir, file_tag, "indices")
 
 
-
 class EmbeddingAlignmentGNN(nn.Module):
 
     def __init__(self, input_dim: int, output_dim: int):
@@ -72,10 +71,12 @@ class EmbeddingAlignmentGNN(nn.Module):
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
     def forward(self, x, edge_index):
+        identity = x
         x = self.projection(x)
         x = self.conv1(x, edge_index)
         x = self.act(x)
         x = self.dropout(x)
+        x = x + identity
         x = self.conv2(x, edge_index)
         x = F.normalize(x, dim=1)
         return x
@@ -263,7 +264,7 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
     plt.style.use('seaborn-v0_8-muted')  # 使用一个漂亮的主题
     fig, ax = plt.subplots(figsize=(8, 5))
 
-    x = range(1, len(train_losses) + 1)
+    x = range(0, len(train_losses))
     ax.plot(x, train_losses, 'b-o', label='Train Loss', markersize=4)
     ax.plot(x, val_losses, 'r-s', label='Val Loss', markersize=4)
 
@@ -407,14 +408,14 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
                 if ("Table", num) in counter:
                     edge_set.add((i, len(texts) + j))
 
-    index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
-    indices = [i for i in range(len(texts))]
-    index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
-    texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
-    for i in range(len(texts_find_indices)):
-        for idx in texts_find_indices[i]:
-            if idx != -1:
-                edge_set.add((idx, len(texts) + i))
+    # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
+    # indices = [i for i in range(len(texts))]
+    # index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
+    # texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
+    # for i in range(len(texts_find_indices)):
+    #     for idx in texts_find_indices[i]:
+    #         if idx != -1:
+    #             edge_set.add((idx, len(texts) + i))
 
     edges = []
     for edge in edge_set:
