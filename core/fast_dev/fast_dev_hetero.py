@@ -17,17 +17,16 @@ import torch.nn.functional as F
 from torch.optim.optimizer import Optimizer
 from torch.utils.data import Subset
 from torch_geometric.loader import DataLoader
-from torch_geometric.data import Data, Dataset
-from torch_geometric.nn import SAGEConv, GINConv, GCNConv
+from torch_geometric.data import Data, Dataset, HeteroData
+from torch_geometric.nn import SAGEConv, GINConv, GCNConv, LayerNorm, HeteroConv
 from loguru import logger
 from pydantic import BaseModel, Field
-
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
 
-
-SPIQA_DIR = os.getenv("SPIQA_DIR", "/home/chenyinbo/.cache/huggingface/hub/datasets--google--spiqa/snapshots/1774b71511f029b82089a069d75328f25fbf0705")
+SPIQA_DIR = os.getenv("SPIQA_DIR",
+                      "/home/chenyinbo/.cache/huggingface/hub/datasets--google--spiqa/snapshots/1774b71511f029b82089a069d75328f25fbf0705")
 WRITE_DIR = os.getenv("WRITE_DIR", "/home/chenyinbo/dataset/graph-rag-output")
 BERT_MODEL_DIR = os.getenv("BERT_MODEL_DIR", "./models/bert-base-uncased")
 API_MODEL = os.getenv("API_MODEL", "qwen-vl-max-2025-08-13")
@@ -46,16 +45,19 @@ def run():
     curr_time = datetime.now().strftime("%Y%m%d%H%M")
 
     dataset_dir = "/home/chenyinbo/dataset/graph-rag-output/graph_dataset"
-    model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth"
+    model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model_fast.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EmbeddingAlignmentGNN(EMB_DIM, EMB_DIM).to(device)
+    model = EmbeddingAlignmentGNN(['image', 'text'], [('image', 'be_reference', 'text'), ('text', 'reference', 'image')],
+                                  {'image': EMB_DIM, 'text': EMB_DIM}, EMB_DIM).to(device)
     model_q = QuestionEncoder(EMB_DIM).to(device)
     if not os.path.exists(model_path):
         train_loader = DataLoader(
-            dataset=build_dataset_subset(GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
-                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train")), cfg),
+            dataset=build_dataset_subset(GraphDataset(train_data_path, os.path.join(dataset_dir, "train"),
+                                                      os.path.join(dataset_dir, "train_images"),
+                                                      os.path.join(dataset_dir, "train_texts"),
+                                                      os.path.join(ROOT_DIR, "train_hetero")), cfg),
             batch_size=cfg.batch_size, shuffle=True, num_workers=4)
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.lr, weight_decay=1e-5)
+        opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3, amsgrad=True)
         train(model, model_q, train_loader, opt, get_num_epochs(cfg), 0.07)
     else:
         model.load_state_dict(torch.load(model_path))
@@ -65,22 +67,18 @@ def run():
 class ExpConfig:
     mode: Literal["fast", "mini", "full"] = "fast"
 
-
     # ---- 数据 ----
-    fast_num_samples: int = 2000 # fast-dev 用多少样本
-    mini_num_samples: int = 10000 # mini-dev
-
+    fast_num_samples: int = 2000  # fast-dev 用多少样本
+    mini_num_samples: int = 10000  # mini-dev
 
     # ---- 训练 ----
     fast_epochs: int = 15
     mini_epochs: int = 15
     full_epochs: int = 100
 
-
     batch_size: int = 128
-    lr: float = 1e-4
+    lr: float = 1e-3
     seed: int = 42
-
 
     # ---- debug ----
     log_grad: bool = True
@@ -112,54 +110,59 @@ def get_num_epochs(cfg: ExpConfig):
         return cfg.full_epochs
 
 
-class GNNBlock(nn.Module):
-    def __init__(self, hidden_dim, dropout=0.3):
-        super().__init__()
-
-        # SAGEConv 内部集成了线性映射，通常不需要像 GIN 那样嵌套一个 MLP
-        # aggr='mean' 是默认值，也可以选 'max' 或 'lstm'
-        self.conv = SAGEConv(hidden_dim, hidden_dim, aggr='mean')
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x, edge_index):
-        h = self.conv(x, edge_index)
-        h = self.norm(h)
-        h = F.relu(h)
-        h = self.dropout(h)
-        # 残差连接
-        return x + h
-
-
 class EmbeddingAlignmentGNN(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.projection = nn.Sequential(
-            nn.LayerNorm(input_dim),
-            nn.Linear(input_dim, input_dim),
-            nn.ReLU(),
-            nn.Dropout(0.3),
-        )
+    def __init__(self, node_types: list, edge_types: list, input_dims: dict, hidden_dim: int):
+        super(EmbeddingAlignmentGNN, self).__init__()
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
-        self.layers = nn.ModuleList([
-            GNNBlock(input_dim, 0.3)
-            for _ in range(2)
-        ])
+        # 1. 为不同节点类型定义各自的投影层
+        self.projections = nn.ModuleDict({
+            node_type: nn.Linear(input_dims[node_type], hidden_dim, bias=False)
+            for node_type in node_types
+        })
 
-        self.out_norm = nn.LayerNorm(input_dim)
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        # 2. 定义第一层异质卷积
+        # HeteroConv 会为每种边类型维护一个独立的 SAGEConv
+        self.conv1 = HeteroConv({
+            edge_type: SAGEConv(hidden_dim, hidden_dim)
+            for edge_type in edge_types
+        }, aggr='sum')  # 不同边类型的消息通过 sum 聚合
 
-    def forward(self, x0, edge_index):
-        x = self.projection(x0)
+        # 3. 定义第二层异质卷积
+        self.conv2 = HeteroConv({
+            edge_type: SAGEConv(hidden_dim, hidden_dim)
+            for edge_type in edge_types
+        }, aggr='sum')
 
-        for layer in self.layers:
-            x = layer(x, edge_index)
+        self.act = nn.ReLU()
+        self.dropout = nn.Dropout(0.1)
 
-        # 最终残差
-        x_out = x0 + x
+    def forward(self, x_dict, edge_index_dict):
+        # x_dict: {'image': x_img, 'text': x_txt}
+        # edge_index_dict: {('image', 'to', 'text'): edge_index, ...}
 
-        x_out = self.out_norm(x_out)
-        return F.normalize(x_out, p=2, dim=-1)
+        # --- 步骤 1: 投影到统一维度 ---
+        out_dict = {}
+        for node_type, x in x_dict.items():
+            out_dict[node_type] = self.projections[node_type](x)
+
+        # 保存用于残差连接的 identity
+        identity_dict = {k: v for k, v in out_dict.items()}
+
+        # --- 步骤 2: 第一层卷积 ---
+        out_dict = self.conv1(out_dict, edge_index_dict)
+        out_dict = {k: self.act(self.dropout(v)) for k, v in out_dict.items()}
+
+        # --- 步骤 3: 残差连接与第二层卷积 ---
+        # 这里的残差是加在投影后的特征上（因为维度一致）
+        out_dict = {k: v + identity_dict[k] for k, v in out_dict.items()}
+
+        out_dict = self.conv2(out_dict, edge_index_dict)
+
+        # --- 步骤 4: 归一化 ---
+        out_dict = {k: F.normalize(v, dim=1) for k, v in out_dict.items()}
+
+        return out_dict
 
 
 class QuestionEncoder(nn.Module):
@@ -225,9 +228,12 @@ class GraphDataset(Dataset):
                 logger.warning(f"data_{i}.pt not found")
                 continue
 
-            questions_images_data = torch.load(os.path.join(self.questions_images_dir, f"data_{i}.pt"), weights_only=False, map_location="cpu")
-            texts_data = torch.load(os.path.join(self.texts_dir, f"data_{i}.pt"), weights_only=False, map_location="cpu")
-            images_data = torch.load(os.path.join(self.images_dir, f"data_{i}.pt"), weights_only=False, map_location="cpu")
+            questions_images_data = torch.load(os.path.join(self.questions_images_dir, f"data_{i}.pt"),
+                                               weights_only=False, map_location="cpu")
+            texts_data = torch.load(os.path.join(self.texts_dir, f"data_{i}.pt"), weights_only=False,
+                                    map_location="cpu")
+            images_data = torch.load(os.path.join(self.images_dir, f"data_{i}.pt"), weights_only=False,
+                                     map_location="cpu")
 
             images_info = []
             for image_name, image_detail in paper["all_figures"].items():
@@ -242,8 +248,10 @@ class GraphDataset(Dataset):
                 question_image_name_pair.append([qa["question"], qa["reference"]])
 
             reference_images_name = [qa["reference"] for qa in paper["qa"]]
-            graph = _make_graph(paper_id, texts_data["texts"], texts_data["texts_embedding"], images_data["all_images_name"],
-                                images_data["all_images_embedding"], reference_images_name, questions_images_data["questions_embedding"],
+            graph = _make_hetero_graph(paper_id, texts_data["texts"], texts_data["texts_embedding"],
+                                images_data["all_images_name"],
+                                images_data["all_images_embedding"], reference_images_name,
+                                questions_images_data["questions_embedding"],
                                 images_info)
             torch.save(graph, target_file_path)
 
@@ -252,19 +260,19 @@ class GraphDataset(Dataset):
 
     def get(self, idx):
         if not os.path.exists(os.path.join(self.processed_dir, f"data_{idx}.pt")):
-            return torch.load(os.path.join(self.processed_dir, f"data_{idx+1}.pt"), weights_only=False, map_location="cpu")
+            return torch.load(os.path.join(self.processed_dir, f"data_{idx + 1}.pt"), weights_only=False,
+                              map_location="cpu")
         data = torch.load(os.path.join(self.processed_dir, f"data_{idx}.pt"), weights_only=False, map_location="cpu")
         return data
 
 
-def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_embedding, reference_images_name, questions_embedding,
-                all_images_info) -> Data:
+def _make_hetero_graph(paper_id, texts, texts_embedding, all_images_name, all_images_embedding, reference_images_name,
+                       questions_embedding,
+                       all_images_info) -> HeteroData:
+    x_dict = {"image": all_images_embedding, "text": texts_embedding}
 
-    x = torch.concat([texts_embedding, all_images_embedding], 0)
-
-    edge_set = set()
-    # for i in range(len(texts) - 1):
-    #     edge_set.add((i, i + 1))
+    text_to_image = []
+    image_to_text = []
 
     for i, text in enumerate(texts):
         counter = count_figure_table(text)
@@ -282,35 +290,42 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
                 num = figure_table_and_num[5:]
             if is_figure:
                 if (("Figure", num) in counter) or ("Fig.", num) in counter:
-                    edge_set.add((i, len(texts) + j))
+                    text_to_image.append([i, j])
+                    image_to_text.append([j, i])
             else:
                 if ("Table", num) in counter:
-                    edge_set.add((i, len(texts) + j))
+                    text_to_image.append([i, j])
+                    image_to_text.append([j, i])
 
-    index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
-    indices = [i for i in range(len(texts))]
-    index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
-    texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
-    for i in range(len(texts_find_indices)):
-        for idx in texts_find_indices[i]:
-            if idx != -1:
-                edge_set.add((idx, len(texts) + i))
+    # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
+    # indices = [i for i in range(len(texts))]
+    # index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
+    # texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
+    # for i in range(len(texts_find_indices)):
+    #     for idx in texts_find_indices[i]:
+    #         if idx != -1:
+    #             text_to_image.append([idx, len(texts) + idx])
+    #             image_to_text.append([len(texts) + idx, idx])
 
-    edges = []
-    for edge in edge_set:
-        edges.append([edge[0], edge[1]])
-        edges.append([edge[1], edge[0]])
+    edge_index_dict = {
+        ("text", "reference", "image"): torch.tensor(text_to_image, dtype=torch.long).t(),
+        ("image", "be_reference", "text"): torch.tensor(image_to_text, dtype=torch.long).t(),
+    }
 
-    edge_index = torch.tensor(edges, dtype=torch.long).t()
+    data = HeteroData()
+    for node_type, x in x_dict.items():
+        data[node_type].x = x
+    for edge_type, edge_index in edge_index_dict.items():
+        data[edge_type].edge_index = edge_index
 
-    all_images_index = torch.tensor([len(texts) + i for i in range(len(all_images_name))], dtype=torch.long)
-    texts_index = torch.tensor([i for i in range(len(texts))], dtype=torch.long)
-    name_to_index = {name: i for i, name in enumerate(all_images_name)}
-    reference_images_index = torch.tensor([name_to_index[name] + len(texts) for name in reference_images_name], dtype=torch.long)
+    data.paper_id = paper_id
+    name_to_idx = {name: i for i, name in enumerate(all_images_name)}
+    data.reference_images_idx = torch.tensor([name_to_idx[name] for name in reference_images_name], dtype=torch.long)
+    data.questions_embedding = questions_embedding
+    data.texts = texts
+    data.all_images_info = all_images_info
 
-    return Data(x, edge_index, paper_id=paper_id, all_images_index=all_images_index, texts_index=texts_index,
-                reference_images_index=reference_images_index, questions_embedding=questions_embedding,
-                texts=texts, all_images_info=all_images_info)
+    return data
 
 
 def count_figure_table(text: str) -> dict:
@@ -326,7 +341,7 @@ def count_figure_table(text: str) -> dict:
 
 
 def train(model: EmbeddingAlignmentGNN, model_q: QuestionEncoder, train_loader: DataLoader, optimizer: Optimizer,
-                        epochs: int, temperature: float = 0.07):
+          epochs: int, temperature: float = 0.07):
     best_val_loss = float("inf")
     not_improve = 0
     losses = []
@@ -338,17 +353,17 @@ def train(model: EmbeddingAlignmentGNN, model_q: QuestionEncoder, train_loader: 
             optimizer.zero_grad()
             start = time.time()
             batch_loss = 0
-            graph_data: Data = graph_data.to(model.device)
-            x_updated = model(graph_data.x, graph_data.edge_index)
+            graph_data = graph_data.to(model.device)
+            x_updated = model(graph_data.x_dict, graph_data.edge_index_dict)
             node_nums = 0
             for i in range(len(graph_data.paper_id)):
                 gi = graph_data[i]
-                images_indices = gi.reference_images_index + node_nums
-                images_embedding = x_updated[images_indices]
-                questions_embedding = model.projection(gi.questions_embedding)
+                images_indices = gi.reference_images_idx + node_nums
+                images_embedding = x_updated["image"][images_indices]
+                questions_embedding = model.projections["text"](gi.questions_embedding)
                 loss = info_nce_loss(questions_embedding, images_embedding, temperature)
                 batch_loss += loss
-                node_nums += graph_data[i].x.size(0)
+                node_nums += graph_data[i].x_dict["image"].size(0)
             batch_loss.backward()
             logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f} {time.time() - start}")
             train_loss += batch_loss.item()
