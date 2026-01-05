@@ -47,7 +47,12 @@ def run():
     dataset_dir = "/home/chenyinbo/dataset/graph-rag-output/graph_dataset"
     model_path = "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model_fast.pth"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = EmbeddingAlignmentGNN(['image', 'text'], [('image', 'be_reference', 'text'), ('text', 'reference', 'image')],
+    model = EmbeddingAlignmentGNN(['image', 'text'],
+                                  [
+                                      ('image', 'be_reference', 'text'), ('text', 'reference', 'image'),
+                                      # ('text', 'before', 'text'), ('text', 'after', 'image'),
+                                      ('text', 'semantic', 'image'), ('image', 'be_semantic', 'text'),
+                                  ],
                                   {'image': EMB_DIM, 'text': EMB_DIM}, EMB_DIM).to(device)
     model_q = QuestionEncoder(EMB_DIM).to(device)
     if not os.path.exists(model_path):
@@ -55,7 +60,7 @@ def run():
             dataset=build_dataset_subset(GraphDataset(train_data_path, os.path.join(dataset_dir, "train"),
                                                       os.path.join(dataset_dir, "train_images"),
                                                       os.path.join(dataset_dir, "train_texts"),
-                                                      os.path.join(ROOT_DIR, "train_hetero")), cfg),
+                                                      os.path.join(ROOT_DIR, "train_hetero_reference_semantic")), cfg),
             batch_size=cfg.batch_size, shuffle=True, num_workers=4)
         opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=1e-3, amsgrad=True)
         train(model, model_q, train_loader, opt, get_num_epochs(cfg), 0.07)
@@ -271,8 +276,14 @@ def _make_hetero_graph(paper_id, texts, texts_embedding, all_images_name, all_im
                        all_images_info) -> HeteroData:
     x_dict = {"image": all_images_embedding, "text": texts_embedding}
 
-    text_to_image = []
-    image_to_text = []
+    text_before_text = []
+    text_after_text = []
+    for i in range(len(texts)-1):
+        text_before_text.append([i, i+1])
+        text_after_text.append([i+1, i])
+
+    text_reference_image = []
+    image_be_reference_text = []
 
     for i, text in enumerate(texts):
         counter = count_figure_table(text)
@@ -290,26 +301,32 @@ def _make_hetero_graph(paper_id, texts, texts_embedding, all_images_name, all_im
                 num = figure_table_and_num[5:]
             if is_figure:
                 if (("Figure", num) in counter) or ("Fig.", num) in counter:
-                    text_to_image.append([i, j])
-                    image_to_text.append([j, i])
+                    text_reference_image.append([i, j])
+                    image_be_reference_text.append([j, i])
             else:
                 if ("Table", num) in counter:
-                    text_to_image.append([i, j])
-                    image_to_text.append([j, i])
+                    text_reference_image.append([i, j])
+                    image_be_reference_text.append([j, i])
 
-    # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
-    # indices = [i for i in range(len(texts))]
-    # index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
-    # texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
-    # for i in range(len(texts_find_indices)):
-    #     for idx in texts_find_indices[i]:
-    #         if idx != -1:
-    #             text_to_image.append([idx, len(texts) + idx])
-    #             image_to_text.append([len(texts) + idx, idx])
+    text_semantic_image = []
+    image_be_semantic_text = []
+    index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
+    indices = [i for i in range(len(texts))]
+    index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
+    texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
+    for i in range(len(texts_find_indices)):
+        for idx in texts_find_indices[i]:
+            if idx != -1:
+                text_semantic_image.append([idx, i])
+                image_be_semantic_text.append([i, idx])
 
     edge_index_dict = {
-        ("text", "reference", "image"): torch.tensor(text_to_image, dtype=torch.long).t(),
-        ("image", "be_reference", "text"): torch.tensor(image_to_text, dtype=torch.long).t(),
+        ("text", "reference", "image"): torch.tensor(text_reference_image, dtype=torch.long).t(),
+        ("image", "be_reference", "text"): torch.tensor(image_be_reference_text, dtype=torch.long).t(),
+        # ("text", "before", "text"): torch.tensor(text_before_text, dtype=torch.long).t(),
+        # ("text", "after", "text"): torch.tensor(text_after_text, dtype=torch.long).t(),
+        ("text", "semantic", "image"): torch.tensor(text_semantic_image, dtype=torch.long).t(),
+        ("image", "be_semantic", "text"): torch.tensor(image_be_semantic_text, dtype=torch.long).t(),
     }
 
     data = HeteroData()

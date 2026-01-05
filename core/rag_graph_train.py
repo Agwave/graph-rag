@@ -43,14 +43,15 @@ def run():
     if not os.path.exists(model_path):
         train_loader = DataLoader(
             dataset=GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
-                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train")),
+                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train_reference_semantic")),
             batch_size=128, shuffle=True, num_workers=4)
         val_loader = DataLoader(
-            dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images"),
-                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val")),
+            dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images_semantic"),
+                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val_reference")),
             batch_size=128, shuffle=False, num_workers=4)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3, amsgrad=True)
         _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
+        model.load_state_dict(torch.load(model_path))
     else:
         model.load_state_dict(torch.load(model_path))
 
@@ -286,12 +287,13 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
 
 
 def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: str, write_dir: str, indices_dir: str):
+    model.eval()
     if not os.path.exists(os.path.join(write_dir, indices_dir)):
         os.makedirs(os.path.join(write_dir, indices_dir))
     im = IndexFileManager(write_dir, indices_dir)
 
     test_loader = DataLoader(dataset=GraphDataset(test_data_path, os.path.join(dataset_dir, "test_a"), os.path.join(dataset_dir, "test_a_images"),
-                                 os.path.join(dataset_dir, "test_a_texts"), os.path.join(ROOT_DIR, "test_a")),
+                                 os.path.join(dataset_dir, "test_a_texts"), os.path.join(ROOT_DIR, "test_a_reference_semantic")),
         batch_size=16, shuffle=True, num_workers=4)
     for batch_idx, graph_data in enumerate(test_loader):
         graph_data: Data = graph_data.to(model.device)
@@ -336,6 +338,7 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: s
 
 
 def _run_search(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: str, write_dir: str, file_tag: str, indices_dir):
+    model.eval()
     with open(test_data_path, "r", encoding="utf-8") as f:
         test_data = json.load(f)
 
@@ -408,14 +411,14 @@ def _make_graph(paper_id, texts, texts_embedding, all_images_name, all_images_em
                 if ("Table", num) in counter:
                     edge_set.add((i, len(texts) + j))
 
-    # index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
-    # indices = [i for i in range(len(texts))]
-    # index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
-    # texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
-    # for i in range(len(texts_find_indices)):
-    #     for idx in texts_find_indices[i]:
-    #         if idx != -1:
-    #             edge_set.add((idx, len(texts) + i))
+    index = faiss.IndexIDMap(faiss.IndexFlatL2(EMB_DIM))
+    indices = [i for i in range(len(texts))]
+    index.add_with_ids(texts_embedding.cpu().detach().numpy(), np.array(indices))
+    texts_distances, texts_find_indices = index.search(all_images_embedding.cpu().detach().numpy(), 5)
+    for i in range(len(texts_find_indices)):
+        for idx in texts_find_indices[i]:
+            if idx != -1:
+                edge_set.add((idx, len(texts) + i))
 
     edges = []
     for edge in edge_set:
