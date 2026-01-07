@@ -50,11 +50,11 @@ def run():
     if not os.path.exists(model_path):
         train_loader = DataLoader(
             dataset=GraphDataset(train_data_path, os.path.join(dataset_dir, "train"), os.path.join(dataset_dir, "train_images"),
-                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train_hetero_reference_semantic")),
+                                 os.path.join(dataset_dir, "train_texts"), os.path.join(ROOT_DIR, "train_hetero_reference_semantic_mean")),
             batch_size=128, shuffle=True, num_workers=4)
         val_loader = DataLoader(
             dataset=GraphDataset(val_data_path, os.path.join(dataset_dir, "val"), os.path.join(dataset_dir, "val_images"),
-                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val_hetero_reference_semantic")),
+                                 os.path.join(dataset_dir, "val_texts"), os.path.join(ROOT_DIR, "val_hetero_reference_semantic_mean")),
             batch_size=128, shuffle=False, num_workers=4)
         opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-3, amsgrad=True)
         _train_and_validate(model, train_loader, val_loader, opt, 100, 0.07)
@@ -82,7 +82,7 @@ class EmbeddingAlignmentGNN(nn.Module):
         self.conv1 = HeteroConv({
             edge_type: SAGEConv(hidden_dim, hidden_dim)
             for edge_type in edge_types
-        }, aggr='sum')  # 不同边类型的消息通过 sum 聚合
+        }, aggr='sum')
 
         # 3. 定义第二层异质卷积
         self.conv2 = HeteroConv({
@@ -203,10 +203,12 @@ class GraphDataset(Dataset):
         return data
 
 
-
 def validate_one_epoch(model, loader, temperature):
     model.eval()
     total_loss = 0
+    total_sample = 0
+    metrics = {"r1": 0, "r3": 0, "mrr": 0, "count": 0}
+
     with torch.no_grad():
         for graph_data in loader:
             batch_loss = 0
@@ -220,26 +222,54 @@ def validate_one_epoch(model, loader, temperature):
                 questions_embedding = model.projections["text"](gi.questions_embedding)
                 loss = info_nce_loss(questions_embedding, images_embedding, temperature)
                 batch_loss += loss
+                total_sample += questions_embedding.size(0)
+
+                # --- 新增：计算 Recall 和 MRR (仅在验证时) ---
+                # 1. 准备当前论文的所有图片和问题（用于排序）
+                norm_qs = F.normalize(questions_embedding, dim=1)
+                norm_imgs = F.normalize(images_embedding, dim=1)
+
+                # 2. 计算得分矩阵 [num_queries, num_paper_images]
+                scores = torch.matmul(norm_qs, norm_imgs.T)
+                gt_indices = gi.reference_images_idx  # 正确图片在当前论文中的索引
+
+                for q_idx, gt_idx in enumerate(gt_indices):
+                    metrics["count"] += 1
+                    _, sorted_idx = torch.sort(scores[q_idx], descending=True)
+                    rank = (sorted_idx == gt_idx).nonzero(as_tuple=True)[0].item()
+                    if rank < 1: metrics["r1"] += 1
+                    if rank < 3: metrics["r3"] += 1
+                    metrics["mrr"] += 1.0 / (rank + 1)
+                # ------------------------------------------
+
                 node_nums += graph_data[i].x_dict["image"].size(0)
             total_loss += batch_loss.item()
-    return total_loss / len(loader)
+
+    avg_loss = total_loss / total_sample
+    # 返回 Loss 和计算好的指标
+    return avg_loss, metrics["r1"] / metrics["count"], metrics["r3"] / metrics["count"], metrics["mrr"] / metrics[
+        "count"]
 
 
-def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, val_loader: DataLoader, optimizer: Optimizer,
-                        epochs: int, temperature: float = 0.07):
-    best_val_loss = float("inf")
+def _train_and_validate(model, train_loader, val_loader, optimizer, epochs, temperature=0.07):
+    best_val = float("inf")
     not_improve = 0
+    total_sample = 0
     train_losses, val_losses = [], []
+    val_r1s, val_r3s, val_mrrs = [], [], []
 
-    logger.info("Calculating initial loss (Epoch 0)...")
-    # 初始状态下，我们假设 train_loss 和 val_loss 差不多，或者只算一次 val 作为基准
-    initial_loss = validate_one_epoch(model, val_loader, temperature)
-    train_losses.append(initial_loss)  # 用验证集初始值占位
+    logger.info("Calculating initial metrics (Epoch 0)...")
+    initial_loss, r1_0, r3_0, mrr_0 = validate_one_epoch(model, val_loader, temperature)
+
+    # 将初始状态存入列表
+    train_losses.append(initial_loss)  # 初始 train_loss 通常与 val_loss 接近，用它占位
     val_losses.append(initial_loss)
-    logger.info(f"Epoch 0/{epochs}, Initial Validation Loss: {initial_loss:.4f}")
+    val_r1s.append(r1_0)
+    val_r3s.append(r3_0)
+    val_mrrs.append(mrr_0)
+    logger.info(f"Epoch 0: Initial ValLoss={initial_loss:.4f}, R1={r1_0:.4f}, R3={r3_0:.4f}, MRR={mrr_0:.4f}")
 
     for epoch in range(epochs):
-
         model.train()
         train_loss = 0
         for batch_idx, graph_data in enumerate(train_loader):
@@ -256,43 +286,30 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
                 questions_embedding = model.projections["text"](gi.questions_embedding)
                 loss = info_nce_loss(questions_embedding, images_embedding, temperature)
                 batch_loss += loss
+                total_sample += questions_embedding.size(0)
                 node_nums += graph_data[i].x_dict["image"].size(0)
             batch_loss.backward()
             logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f} {time.time() - start}")
             train_loss += batch_loss.item()
             optimizer.step()
 
-        avg_train_loss = train_loss / len(train_loader)
+        avg_train_loss = train_loss / total_sample
         logger.info(f"epoch {epoch + 1}/{epochs}, loss: {avg_train_loss:.4f}")
         train_losses.append(avg_train_loss)
 
-        model.eval()
-        val_loss = 0
-        with torch.no_grad():
-            for batch_idx, graph_data in enumerate(val_loader):
-                start = time.time()
-                batch_loss = 0
-                graph_data = graph_data.to(model.device)
-                x_updated = model(graph_data.x_dict, graph_data.edge_index_dict)
-                node_nums = 0
-                for i in range(len(graph_data.paper_id)):
-                    gi = graph_data[i]
-                    images_indices = gi.reference_images_idx + node_nums
-                    images_embedding = x_updated["image"][images_indices]
-                    questions_embedding = model.projections["text"](gi.questions_embedding)
-                    loss = info_nce_loss(questions_embedding, images_embedding, temperature)
-                    batch_loss += loss
-                    node_nums += graph_data[i].x_dict["image"].size(0)
-                val_loss += batch_loss.item()
-                logger.debug(f"batch: {batch_idx + 1}, loss: {batch_loss:.4f} {time.time() - start}")
-        avg_val_loss = val_loss / len(val_loader)
+        # 调用修改后的验证函数
+        avg_val_loss, r1, r3, mrr = validate_one_epoch(model, val_loader, temperature)
         val_losses.append(avg_val_loss)
-        logger.info(f"validation Loss: {avg_val_loss:.4f}")
+        val_r1s.append(r1)
+        val_r3s.append(r3)
+        val_mrrs.append(mrr)
 
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
+        logger.info(f"Epoch {epoch + 1}: ValLoss={avg_val_loss:.4f}, R1={r1:.4f}, R3={r3:.4f}, MRR={mrr:.4f}")
+
+        if avg_val_loss < best_val:
+            best_val = avg_val_loss
             torch.save(model.state_dict(), "/home/chenyinbo/dataset/graph-rag-output/best_gnn_model.pth")
-            logger.info(f"saved best model with Validation Loss: {best_val_loss:.4f}")
+            logger.info(f"saved best model: best_val {best_val:.4f}")
             not_improve = 0
         else:
             not_improve += 1
@@ -300,32 +317,45 @@ def _train_and_validate(model: EmbeddingAlignmentGNN, train_loader: DataLoader, 
                 logger.info(f"train {not_improve} epoch no improve, early stop")
                 break
 
-    # 打印最终的 Loss 列表，方便以后手动绘图
-    logger.info(f"Final Train Losses: {train_losses}")
-    logger.info(f"Final Val Losses: {val_losses}")
+    # --- 绘图：2x1 上下排列 (更适合文档复制) ---
+    plt.style.use('seaborn-v0_8-muted')
+    # 调整为上下布局，figsize 宽度减小高度增加，确保每一张图都有足够的纵向空间
+    fig, (ax_l, ax_r) = plt.subplots(2, 1, figsize=(10, 12), dpi=120)
+    x = range(len(train_losses))
 
-    # 绘制更专业的图表
-    plt.style.use('seaborn-v0_8-muted')  # 使用一个漂亮的主题
-    fig, ax = plt.subplots(figsize=(8, 5))
+    # === 上图：Loss 曲线 (带 Best 标注) ===
+    ax_l.plot(x, train_losses, 'b-o', label='Train Loss', markersize=5, alpha=0.7, linewidth=2)
+    ax_l.plot(x, val_losses, 'r-s', label='Val Loss', markersize=5, linewidth=2)
 
-    x = range(0, len(train_losses))
-    ax.plot(x, train_losses, 'b-o', label='Train Loss', markersize=4)
-    ax.plot(x, val_losses, 'r-s', label='Val Loss', markersize=4)
-
-    # 找到并标注最小验证损耗点
     min_val_idx = val_losses.index(min(val_losses))
-    ax.annotate(f'Best: {val_losses[min_val_idx]:.4f}',
-                xy=(x[min_val_idx], val_losses[min_val_idx]),
-                xytext=(x[min_val_idx], val_losses[min_val_idx] + 0.5),
-                arrowprops=dict(facecolor='black', shrink=0.05))
+    # 动态调整标注偏移量，确保不被遮挡
+    offset = (max(val_losses) - min(val_losses)) * 0.15
+    ax_l.annotate(f'Best Loss: {val_losses[min_val_idx]:.4f}',
+                  xy=(x[min_val_idx], val_losses[min_val_idx]),
+                  xytext=(x[min_val_idx], val_losses[min_val_idx] + offset),
+                  arrowprops=dict(facecolor='black', shrink=0.05, width=1.5, headwidth=7),
+                  fontsize=11, fontweight='bold')
 
-    ax.set_xlabel('Epoch')
-    ax.set_ylabel('Loss')
-    ax.set_title('Learning Curves (Embedding Alignment)')
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax_l.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax_l.set_ylabel('Loss Value', fontsize=12, fontweight='bold')
+    ax_l.set_title('A: Training & Validation Loss', fontsize=14, pad=15)
+    ax_l.legend(fontsize=11)
+    ax_l.grid(True, alpha=0.3)
 
-    plt.tight_layout()
+    # === 下图：Retrieval Metrics (Recall@1, Recall@3, MRR) ===
+    ax_r.plot(x, val_r1s, 'b-o', label='Recall@1', markersize=6, linewidth=2.5)
+    ax_r.plot(x, val_r3s, 'g-^', label='Recall@3', markersize=6, linewidth=2.5)
+    ax_r.plot(x, val_mrrs, 'm-s', label='MRR', markersize=6, linewidth=2.5)
+
+    ax_r.set_xlabel('Epoch', fontsize=12, fontweight='bold')
+    ax_r.set_ylabel('Performance Score', fontsize=12, fontweight='bold')
+    ax_r.set_title('B: Retrieval Evaluation Metrics', fontsize=14, pad=15)
+    ax_r.set_ylim(0, 1.0)
+    ax_r.legend(loc='lower right', fontsize=11)
+    ax_r.grid(True, alpha=0.3)
+
+    # 增加子图间的间距
+    plt.tight_layout(pad=4.0)
     plt.show()
 
 
@@ -336,7 +366,7 @@ def _run_index(model: EmbeddingAlignmentGNN, test_data_path: str, dataset_dir: s
     im = IndexFileManager(write_dir, indices_dir)
 
     test_loader = DataLoader(dataset=GraphDataset(test_data_path, os.path.join(dataset_dir, "test_a"), os.path.join(dataset_dir, "test_a_images"),
-                                 os.path.join(dataset_dir, "test_a_texts"), os.path.join(ROOT_DIR, "test_a_hetero_reference_semantic")),
+                                 os.path.join(dataset_dir, "test_a_texts"), os.path.join(ROOT_DIR, "test_a_hetero_reference_semantic_mean")),
         batch_size=16, shuffle=True, num_workers=4)
     for batch_idx, graph_data in enumerate(test_loader):
         graph_data = graph_data.to(model.device)
